@@ -1,0 +1,9 @@
+{
+  "name": "test",
+  "description": "Doorway-only scene for entry/exit counting (TEST.mp4, 1280x720)",
+  "line_start": [0.50, 0.10],
+  "line_end": [0.50, 0.90],
+  "entry_direction": "left_to_right",
+  "tables": []
+}
+

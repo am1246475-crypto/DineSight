@@ -1,0 +1,15 @@
+{
+  "name": "case",
+  "description": "Small diner with booths and bar counter (case.mp4, 768x432)",
+  "line_start": [0.34, 0.20],
+  "line_end": [0.34, 0.85],
+  "entry_direction": "left_to_right",
+  "tables": [
+    {"id": 1, "name": "Booth 1 (Front)", "box_ratio": [0.00, 0.55, 0.46, 1.00], "capacity": 4},
+    {"id": 2, "name": "Booth 2 (Mid)",   "box_ratio": [0.35, 0.42, 0.58, 0.74], "capacity": 4},
+    {"id": 3, "name": "Booth 3 (Rear)",  "box_ratio": [0.54, 0.40, 0.72, 0.65], "capacity": 4},
+    {"id": 4, "name": "Bar (Front)",     "box_ratio": [0.63, 0.50, 1.00, 1.00], "capacity": 3},
+    {"id": 5, "name": "Bar (Rear)",      "box_ratio": [0.78, 0.35, 1.00, 0.60], "capacity": 3}
+  ]
+}
+

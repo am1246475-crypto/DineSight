@@ -1,0 +1,35 @@
+# Virtual Environment (37,000+ files)
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Heavy weights & downloaded models
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Generated outputs & video binaries
+videos/detected*.mp4
+videos/*.mp4
+videos/*.avi
+videos/*.mov
+
+# IDE & Editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+

@@ -1,0 +1,20 @@
+{
+  "name": "test2",
+  "description": "Large restaurant with 10 dining tables (test2.mp4, 1280x720)",
+  "line_start": [0.35, 0.15],
+  "line_end": [0.35, 0.45],
+  "entry_direction": "left_to_right",
+  "tables": [
+    {"id": 1,  "name": "Table 1",  "desc": "Front Left",         "box_ratio": [0.00, 0.62, 0.25, 1.00], "capacity": 4},
+    {"id": 2,  "name": "Table 2",  "desc": "Front Center (#9)",  "box_ratio": [0.29, 0.73, 0.51, 1.00], "capacity": 2},
+    {"id": 3,  "name": "Table 3",  "desc": "Front Right",        "box_ratio": [0.56, 0.62, 1.00, 1.00], "capacity": 4},
+    {"id": 4,  "name": "Table 4",  "desc": "Mid Left",           "box_ratio": [0.03, 0.44, 0.25, 0.62], "capacity": 4},
+    {"id": 5,  "name": "Table 5",  "desc": "Center Mid",         "box_ratio": [0.33, 0.57, 0.48, 0.74], "capacity": 2},
+    {"id": 6,  "name": "Table 6",  "desc": "Mid Right",          "box_ratio": [0.51, 0.46, 1.00, 0.64], "capacity": 4},
+    {"id": 7,  "name": "Table 7",  "desc": "Center Upper",       "box_ratio": [0.34, 0.33, 0.47, 0.56], "capacity": 2},
+    {"id": 8,  "name": "Table 8",  "desc": "Upper Left",         "box_ratio": [0.08, 0.30, 0.26, 0.46], "capacity": 4},
+    {"id": 9,  "name": "Table 9",  "desc": "Upper Right",        "box_ratio": [0.49, 0.30, 0.82, 0.47], "capacity": 4},
+    {"id": 10, "name": "Table 10", "desc": "Back Window",        "box_ratio": [0.34, 0.21, 0.44, 0.33], "capacity": 2}
+  ]
+}
+
