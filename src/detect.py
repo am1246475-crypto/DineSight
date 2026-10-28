@@ -43,6 +43,7 @@ except ImportError:
     from src.count import DineSightCounter
 
 # Configuration Defaults
+# =====================================================================
 DEFAULT_VIDEO = Path("videos/case.mp4")
 DEFAULT_OUTPUT = Path("videos/detected_case.mp4")
 MODEL_PATH = "yolo11n.pt"
@@ -50,7 +51,9 @@ TRACKER_CONFIG = "bytetrack_custom.yaml"
 PROFILES_DIR = Path("profiles")
 
 
+# =====================================================================
 # Scene Configuration Loader
+# =====================================================================
 def load_scene_profile(
     profile_name_or_path: Optional[str],
     video_path: Path,
@@ -120,7 +123,9 @@ def load_scene_profile(
     return line, entry_direction, tables
 
 
+# =====================================================================
 # Dynamic Table Auto-Discovery
+# =====================================================================
 def discover_tables_dynamically(
     cap: cv2.VideoCapture,
     model: YOLO,
@@ -187,7 +192,9 @@ def discover_tables_dynamically(
     return discovered
 
 
+# =====================================================================
 # Track Analytics State (Sliding Window Movement, 4-state classification)
+# =====================================================================
 class TrackAnalytics:
     """
     Maintains per-track behavioral metrics over a temporal window.
@@ -271,7 +278,9 @@ class TrackAnalytics:
                 self.state = "CUSTOMER"
 
 
+# =====================================================================
 # Main DineSight Pipeline
+# =====================================================================
 def run_dinesight_pipeline(
     video_path: Path,
     output_path: Path,
@@ -532,7 +541,9 @@ def run_dinesight_pipeline(
     print("=" * 70)
 
 
+# =====================================================================
 # CLI Entry Point
+# =====================================================================
 def main():
     parser = argparse.ArgumentParser(description="DineSight Unified Vision Analytics")
     parser.add_argument("video_path", nargs="?", default=str(DEFAULT_VIDEO), help="Input video file path")
