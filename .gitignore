@@ -26,6 +26,7 @@ videos/detected*.mp4
 videos/*.mp4
 videos/*.avi
 videos/*.mov
+runs/streamlit/
 
 # IDE & Editor configs
 .vscode/

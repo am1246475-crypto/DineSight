@@ -1,32 +1,26 @@
 """
-DineSight Detection Module (src/detect.py)
+DineSight Vision Pipeline (src/detect.py)
 
-Architecture:
-1. Video Ingestion & Validation (codec, resolution, fps)
-2. Detection & Multi-Object Tracking (YOLOv11 + ByteTrack)
-3. Scene Configuration:
-   - Explicit Profile Mode (loads JSON config from profiles/ or file path)
-   - Dynamic Auto-Discovery Mode (clusters tables/chairs from video frames)
-4. Per-Track Lifecycle, Movement & Role Classification:
-   - Recent velocity / sliding window displacement (normalized for FPS)
-   - 4-state lifecycle: UNKNOWN, CUSTOMER, STAFF, LOST
-   - Stable table assignment (hysteresis / temporal smoothing)
-   - Tracks assigned to at most one table at a time
-5. Counting & Metrics Orchestration (delegated to DineSightCounter):
-   - Explicit separated metrics: people_detected_now, active_tracks,
-     customers_estimated, staff_estimated, unknown_people,
-     entries, exits, net_change
-6. Visualization & Export (Live HUD, table polygons/boxes, role tags)
+People detection + tracking (YOLO11 + ByteTrack), doorway entry/exit counting,
+table occupancy and customer/staff classification.
+
+Everything that used to be hard-coded is now derived from the video itself:
+  * fps / resolution  -> all thresholds are in seconds or relative to body size
+  * tables            -> auto-discovered from persistent tables + chairs
+  * doorway + entry   -> auto-estimated from where people appear / disappear
+                         (or taken from a profile / --line / --entry-dir)
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
-from pathlib import Path
+import math
 import sys
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -43,17 +37,28 @@ except ImportError:
     from src.count import DineSightCounter
 
 # Configuration Defaults
-# =====================================================================
 DEFAULT_VIDEO = Path("videos/case.mp4")
 DEFAULT_OUTPUT = Path("videos/detected_case.mp4")
 MODEL_PATH = "yolo11n.pt"
 TRACKER_CONFIG = "bytetrack_custom.yaml"
 PROFILES_DIR = Path("profiles")
 
+PERSON, CHAIR, TABLE = 0, 56, 60  # COCO class ids
+VALID_DIRECTIONS = ["left_to_right", "right_to_left", "top_to_bottom", "bottom_to_top"]
 
-# =====================================================================
+Source = Union[str, int, Path]
+Box = Tuple[int, int, int, int]
+
+
+def resolve_tracker_config() -> str:
+    for cand in (Path(TRACKER_CONFIG), CURRENT_DIR.parent / TRACKER_CONFIG, CURRENT_DIR / TRACKER_CONFIG):
+        if cand.exists():
+            return str(cand)
+    return "bytetrack.yaml"
+
+
 # Scene Configuration Loader
-# =====================================================================
+
 def load_scene_profile(
     profile_name_or_path: Optional[str],
     video_path: Path,
@@ -64,8 +69,8 @@ def load_scene_profile(
     Loads scene configuration (doorway line, entry direction, table zones).
     Priority:
     1. Explicit profile path or name passed via CLI (--profile).
-    2. Fallback to check if a profile matches a known profile name.
-    3. Return None to trigger dynamic auto-discovery.
+    2. A profile named after the video file (profiles/<video-stem>.json).
+    3. Nothing -> (None, "left_to_right", []) which triggers auto-discovery.
     """
     config_data = None
 
@@ -80,10 +85,8 @@ def load_scene_profile(
         else:
             print(f"[Config Warning] Profile '{profile_name_or_path}' not found.")
 
-    # Optional fallback based on known video name (convenience for benchmark test runs)
     if config_data is None:
-        video_stem = video_path.stem.lower()
-        candidate = PROFILES_DIR / f"{video_stem}.json"
+        candidate = PROFILES_DIR / f"{video_path.stem.lower()}.json"
         if candidate.exists():
             with open(candidate, "r", encoding="utf-8") as f:
                 config_data = json.load(f)
@@ -92,11 +95,9 @@ def load_scene_profile(
     if not config_data:
         return None, "left_to_right", []
 
-    # Parse doorway line
     line = None
     if "line_start" in config_data and "line_end" in config_data:
-        ls = config_data["line_start"]
-        le = config_data["line_end"]
+        ls, le = config_data["line_start"], config_data["line_end"]
         line = (
             (int(ls[0] * width), int(ls[1] * height)),
             (int(le[0] * width), int(le[1] * height)),
@@ -104,264 +105,656 @@ def load_scene_profile(
 
     entry_direction = config_data.get("entry_direction", "left_to_right")
 
-    # Parse tables
     tables = []
     for t in config_data.get("tables", []):
         bx = t["box_ratio"]
         tables.append({
             "id": t["id"],
             "name": t.get("name", f"Table {t['id']}"),
-            "box": (
-                int(bx[0] * width),
-                int(bx[1] * height),
-                int(bx[2] * width),
-                int(bx[3] * height),
-            ),
+            "box": (int(bx[0] * width), int(bx[1] * height), int(bx[2] * width), int(bx[3] * height)),
             "capacity": t.get("capacity", 4),
         })
 
     return line, entry_direction, tables
 
 
-# =====================================================================
+
+# Geometry helpers
+
+def _iou_matrix(boxes: np.ndarray) -> np.ndarray:
+    ix1 = np.maximum(boxes[:, None, 0], boxes[None, :, 0])
+    iy1 = np.maximum(boxes[:, None, 1], boxes[None, :, 1])
+    ix2 = np.minimum(boxes[:, None, 2], boxes[None, :, 2])
+    iy2 = np.minimum(boxes[:, None, 3], boxes[None, :, 3])
+    inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    union = area[:, None] + area[None, :] - inter
+    return inter / np.maximum(union, 1e-9)
+
+
+def _box_gap(a, b) -> float:
+    """Distance between two boxes (0 when they overlap)."""
+    dx = max(0.0, max(a[0], b[0]) - min(a[2], b[2]))
+    dy = max(0.0, max(a[1], b[1]) - min(a[3], b[3]))
+    return math.hypot(dx, dy)
+
+
+def _group_by_iou(dets: List[tuple], thr: float = 0.35) -> List[List[tuple]]:
+    """
+    Group detections (frame_idx, cls, box) that are the same static object seen in
+    different frames.  Two boxes from the SAME frame are different objects, never merged.
+    """
+    if not dets:
+        return []
+    boxes = np.array([d[2] for d in dets], dtype=float)
+    iou = _iou_matrix(boxes)
+    parent = list(range(len(dets)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    ii, jj = np.where(np.triu(iou, 1) > thr)
+    for i, j in zip(ii.tolist(), jj.tolist()):
+        if dets[i][0] == dets[j][0]:
+            continue
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    groups: Dict[int, List[tuple]] = {}
+    for i, d in enumerate(dets):
+        groups.setdefault(find(i), []).append(d)
+    return list(groups.values())
+
+
+def pick_table_zone(box: Tuple[float, float, float, float], tables: List[Dict]) -> Optional[int]:
+    """Zone a person belongs to: centre inside the zone, or a large share of the body overlapping it."""
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    area = max(1.0, (x2 - x1) * (y2 - y1))
+    best_id, best_score = None, 0.0
+    for t in tables:
+        bx1, by1, bx2, by2 = t["box"]
+        ix = max(0.0, min(x2, bx2) - max(x1, bx1))
+        iy = max(0.0, min(y2, by2) - max(y1, by1))
+        overlap = ix * iy / area
+        inside = bx1 <= cx <= bx2 and by1 <= cy <= by2
+        if inside or overlap >= 0.35:
+            score = overlap + (0.5 if inside else 0.0)
+            if score > best_score:
+                best_id, best_score = t["id"], score
+    return best_id
+
+
+
 # Dynamic Table Auto-Discovery
-# =====================================================================
+def sample_video_frames(cap: cv2.VideoCapture, n: int = 35) -> List[np.ndarray]:
+    """Evenly spaced frames of a file (then rewinds). For live streams, grabs n frames spread over a few seconds."""
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames: List[np.ndarray] = []
+    if total > 0:
+        for idx in np.linspace(0, total - 1, min(n, total)).astype(int).tolist():
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if ok:
+                frames.append(frame)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    else:  # live stream: cannot seek; these frames are consumed
+        for _ in range(min(n, 20)):
+            for _ in range(3):
+                cap.grab()
+            ok, frame = cap.read()
+            if ok:
+                frames.append(frame)
+    return frames
+
+
+def build_table_zones(dets: List[tuple], n_frames: int, width: int, height: int) -> List[Dict]:
+    """
+    Turn raw table/chair detections (frame_idx, cls, box) from sampled frames into table zones.
+
+    1. Static objects are found by grouping detections across frames; an object must be
+       seen in >=15% of the sampled frames (people walking past do not create tables).
+    2. Each detected table becomes a zone; chairs close to a table join it.
+    3. Chairs with no table (tables are often missed by YOLO) form their own zone
+       when 2+ chairs sit next to each other.
+    4. Zone boxes are padded proportionally (seated people lean outside the furniture).
+    5. Capacity = number of chairs found (min 2), else estimated from the table size.
+    """
+    if n_frames <= 0 or not dets:
+        return []
+
+    min_seen = max(2, int(math.ceil(0.15 * n_frames)))
+    objects: Dict[int, List[np.ndarray]] = {CHAIR: [], TABLE: []}
+    for cls in (CHAIR, TABLE):
+        subset = [d for d in dets if d[1] == cls]
+        for g in _group_by_iou(subset, 0.35):
+            if len({d[0] for d in g}) >= min_seen:
+                objects[cls].append(np.median(np.array([d[2] for d in g], dtype=float), axis=0))
+
+    zones: List[Dict] = [{"boxes": [t], "chairs": 0, "has_table": True} for t in objects[TABLE]]
+
+    orphans: List[np.ndarray] = []
+    for chair in objects[CHAIR]:
+        best, best_gap = None, None
+        for z in zones:
+            tb = z["boxes"][0]
+            gap = _box_gap(chair, tb)
+            limit = 0.6 * max(tb[2] - tb[0], tb[3] - tb[1])
+            if gap <= limit and (best_gap is None or gap < best_gap):
+                best, best_gap = z, gap
+        if best is None:
+            orphans.append(chair)
+        else:
+            best["boxes"].append(chair)
+            best["chairs"] += 1
+
+    groups: List[List[np.ndarray]] = []
+    for chair in orphans:
+        size = max(chair[2] - chair[0], chair[3] - chair[1])
+        near = [g for g in groups if any(_box_gap(chair, o) <= 0.8 * size for o in g)]
+        merged = [chair]
+        for g in near:
+            merged.extend(g)
+        groups = [g for g in groups if all(g is not n for n in near)]
+        groups.append(merged)
+    for g in groups:
+        if len(g) >= 2:
+            zones.append({"boxes": list(g), "chairs": len(g), "has_table": False})
+
+    result = []
+    for z in zones:
+        arr = np.array(z["boxes"], dtype=float)
+        x1, y1, x2, y2 = arr[:, 0].min(), arr[:, 1].min(), arr[:, 2].max(), arr[:, 3].max()
+        w, h = x2 - x1, y2 - y1
+        px, py = max(8.0, 0.10 * w), max(8.0, 0.10 * h)
+        box = (
+            max(0, int(x1 - px)), max(0, int(y1 - py)),
+            min(width, int(x2 + px)), min(height, int(y2 + py)),
+        )
+        if z["chairs"] >= 1:
+            capacity = int(min(10, max(2, z["chairs"])))
+        else:
+            capacity = 4 if (w * h) > (width * height * 0.04) else 2
+        result.append({"box": box, "capacity": capacity})
+
+    result.sort(key=lambda r: (round(((r["box"][1] + r["box"][3]) / 2) / (0.12 * height)), r["box"][0]))
+    for i, r in enumerate(result):
+        r["id"] = i + 1
+        r["name"] = f"Table {i + 1}"
+    return result
+
+
 def discover_tables_dynamically(
-    cap: cv2.VideoCapture,
+    frames: List[np.ndarray],
     model: YOLO,
     width: int,
     height: int,
-    sample_frames: int = 35,
+    conf: float = 0.18,
 ) -> List[Dict]:
+    """Detect tables and chairs on sampled frames and build zones from the persistent ones."""
+    dets: List[tuple] = []
+    for i, frame in enumerate(frames):
+        res = model(frame, classes=[CHAIR, TABLE], conf=conf, verbose=False)[0]
+        if res.boxes is None or len(res.boxes) == 0:
+            continue
+        for b, c in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.cls.int().cpu().tolist()):
+            dets.append((i, int(c), b))
+    return build_table_zones(dets, len(frames), width, height)
+
+
+
+# Dynamic Doorway Auto-Discovery
+
+def _clip_segment(center: np.ndarray, direction: np.ndarray, half: float, width: int, height: int):
+    center = np.clip(center, [0, 0], [width - 1, height - 1])
+
+    def reach(sign: float) -> float:
+        t = half
+        for axis, limit in ((0, width - 1), (1, height - 1)):
+            d = direction[axis] * sign
+            if abs(d) < 1e-9:
+                continue
+            bound = limit if d > 0 else 0
+            t = min(t, (bound - center[axis]) / d)
+        return max(t, 0.0)
+
+    a = center - direction * reach(-1.0)
+    b = center + direction * reach(1.0)
+    return (int(a[0]), int(a[1])), (int(b[0]), int(b[1]))
+
+
+def estimate_doorway(
+    tracks: Dict[int, List[Tuple[int, float, float]]],
+    width: int,
+    height: int,
+    fps: float,
+    min_track_s: float = 1.0,
+) -> Optional[Dict]:
     """
-    Scans initial sample frames of any video to discover stable dining tables
-    and seating clusters using YOLO dining table (60) and chair (56) detections.
+    Estimate the doorway line and entry direction from people trajectories
+    ``track_id -> [(frame_idx, foot_x, foot_y), ...]``.
+
+    A door is where people APPEAR and DISAPPEAR while walking in a consistent
+    direction.  For every walking track we take its start (direction = where it goes next)
+    and its end (direction reversed = where it came from).  Both point "into the room"
+    at a real door, so they add up; at an occlusion hot-spot they cancel out, which is
+    how the two are told apart.
+
+    The line is drawn perpendicular to that flow, slightly INSIDE the room so that people
+    are already visible on the outside before they cross it.
     """
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // sample_frames)
-    candidates = []
+    scale = float(max(width, height))
+    ends = []
+    for pts in tracks.values():
+        if len(pts) < 3:
+            continue
+        if (pts[-1][0] - pts[0][0]) / fps < min_track_s:
+            continue
+        x0, y0, x1, y1 = pts[0][1], pts[0][2], pts[-1][1], pts[-1][2]
+        disp = math.hypot(x1 - x0, y1 - y0)
+        if disp < 0.12 * scale:
+            continue
+        ux, uy = (x1 - x0) / disp, (y1 - y0) / disp
+        ends.append((x0, y0, ux, uy))
+        ends.append((x1, y1, -ux, -uy))
+    if len(ends) < 6:
+        return None
 
-    for f_idx in range(0, min(total_frames, sample_frames * step), step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-        ok, frame = cap.read()
-        if not ok:
-            break
-        res = model(frame, classes=[56, 60], conf=0.18, verbose=False)[0]
-        if res.boxes is not None:
-            for b in res.boxes.xyxy.cpu().numpy():
-                candidates.append(b)
+    arr = np.array(ends, dtype=float)
+    cell = 0.12 * scale
+    gx = np.floor(arr[:, 0] / cell).astype(int)
+    gy = np.floor(arr[:, 1] / cell).astype(int)
+    best_mask, best_n = None, 0
+    for cx_i, cy_i in set(zip(gx.tolist(), gy.tolist())):
+        mask = (np.abs(gx - cx_i) <= 1) & (np.abs(gy - cy_i) <= 1)
+        n = int(mask.sum())
+        if n > best_n:
+            best_n, best_mask = n, mask
+    if best_mask is None or best_n < max(4, int(0.25 * len(arr))):
+        return None
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Rewind video
+    cluster = arr[best_mask]
+    centroid = cluster[:, :2].mean(axis=0)
+    flow = cluster[:, 2:4].mean(axis=0)
+    resultant = float(np.hypot(flow[0], flow[1]))
+    if resultant < 0.5:
+        return None
+    flow = flow / resultant
+    perp = np.array([-flow[1], flow[0]])
 
-    if not candidates:
-        return []
+    rel = cluster[:, :2] - centroid
+    along_std = float((rel @ flow).std())
+    across_std = float((rel @ perp).std())
+    offset = float(np.clip(0.05 * scale + along_std, 0.05 * scale, 0.15 * scale))
+    half = float(np.clip(0.06 * scale + 2.0 * across_std, 0.10 * scale, 0.35 * scale))
 
-    # Cluster detections into distinct spatial zones
-    clusters = []
-    max_dist = max(width, height) * 0.08  # 8% screen distance
+    start, end = _clip_segment(centroid + flow * offset, perp, half, width, height)
+    if math.hypot(end[0] - start[0], end[1] - start[1]) < 0.08 * scale:
+        return None
+    return {
+        "line": (start, end),
+        "entry_vector": (float(flow[0]), float(flow[1])),
+        "confidence": resultant,
+        "endpoints": len(arr),
+    }
 
-    for box in candidates:
-        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-        matched = False
-        for c in clusters:
-            c_center = np.mean([((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in c], axis=0)
-            if np.linalg.norm(np.array([cx, cy]) - c_center) < max_dist:
-                c.append(box)
-                matched = True
+
+def scan_tracks(
+    source: Path,
+    model_path: str,
+    tracker: str,
+    fps: float,
+    seconds: float,
+    conf: float,
+    imgsz: int,
+) -> Dict[int, List[Tuple[int, float, float]]]:
+    """Quick tracking pre-pass (own model + capture, ~12 fps) used to estimate the doorway."""
+    cap = cv2.VideoCapture(str(source))
+    scan_model = YOLO(model_path)
+    stride = max(1, int(round(fps / 12.0)))
+    max_frames = int(seconds * fps)
+    tracks: Dict[int, List[Tuple[int, float, float]]] = {}
+    frame_idx = 0
+    try:
+        while frame_idx < max_frames:
+            ok, frame = cap.read()
+            if not ok:
                 break
-        if not matched:
-            clusters.append([box])
-
-    min_detections = max(3, len(candidates) // (sample_frames * 2))
-    persistent = [c for c in clusters if len(c) >= min_detections]
-
-    discovered = []
-    for i, c in enumerate(sorted(persistent, key=lambda x: len(x), reverse=True)):
-        arr = np.array(c)
-        x1 = max(0, int(np.percentile(arr[:, 0], 15) - 10))
-        y1 = max(0, int(np.percentile(arr[:, 1], 15) - 10))
-        x2 = min(width, int(np.percentile(arr[:, 2], 85) + 10))
-        y2 = min(height, int(np.percentile(arr[:, 3], 85) + 10))
-        discovered.append({
-            "id": i + 1,
-            "name": f"Table {i + 1}",
-            "box": (x1, y1, x2, y2),
-            "capacity": 4 if (x2 - x1) * (y2 - y1) > (width * height * 0.04) else 2,
-        })
-
-    return discovered
+            res = scan_model.track(
+                frame, persist=True, tracker=tracker, classes=[PERSON], conf=conf, imgsz=imgsz, verbose=False
+            )[0]
+            if res.boxes is not None and res.boxes.id is not None:
+                for b, tid in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.id.int().cpu().tolist()):
+                    tracks.setdefault(tid, []).append((frame_idx, float((b[0] + b[2]) / 2), float(b[3])))
+            for _ in range(stride - 1):
+                if not cap.grab():
+                    break
+            frame_idx += stride
+    finally:
+        cap.release()
+    return tracks
 
 
-# =====================================================================
-# Track Analytics State (Sliding Window Movement, 4-state classification)
-# =====================================================================
+
+# Track Analytics (time-based, resolution-independent)
+
+@dataclass
+class AnalyticsConfig:
+    still_speed: float = 0.25       # body-heights / s: below = standing/sitting still
+    moving_speed: float = 0.45      # body-heights / s: above = walking
+    assign_s: float = 0.4           # time inside a zone before it is assigned
+    switch_s: float = 1.0           # time inside ANOTHER zone before switching
+    release_s: float = 1.5          # time outside every zone before releasing
+    customer_dwell_s: float = 8.0   # seated time at one table that makes a CUSTOMER
+    staff_observe_s: float = 20.0   # minimum time on screen before judging STAFF
+    staff_walk_ratio: float = 0.35  # share of time walking that marks STAFF
+    window_s: float = 1.5           # sliding window for speed
+    reclaim_s: float = 4.0          # how long a vanished track may be re-adopted
+
+
 class TrackAnalytics:
     """
-    Maintains per-track behavioral metrics over a temporal window.
-    States:
-      - UNKNOWN: newly observed, insufficient evidence
-      - CUSTOMER: stable residency at a dining table with low movement
-      - STAFF: high velocity / walking along corridors without seated residency
-      - LOST: track has disappeared
+    Per-track behaviour over time.  States:
+      - UNKNOWN : not enough evidence yet (new arrivals walking to their table stay here)
+      - CUSTOMER: sat still at one table for >= customer_dwell_s (sticky, also while leaving)
+      - STAFF   : on screen long enough, never settled at a table, and keeps walking
+                  or moves between tables
     """
 
-    def __init__(self, track_id: int, window_size: int = 30):
+    def __init__(self, track_id: int, fps: float, cfg: AnalyticsConfig):
         self.track_id = track_id
-        self.positions: deque = deque(maxlen=window_size)  # (frame_idx, cx, cy)
-        self.total_frames: int = 0
-        self.table_residency: Dict[int, int] = {}  # table_id -> frame_count
-        self.current_assigned_table: Optional[int] = None
-        self.consecutive_table_frames: int = 0
-        self.frames_since_in_zone: int = 0
-        self.state: str = "UNKNOWN"
-        self.last_seen_frame: int = 0
+        self.fps = fps
+        self.cfg = cfg
+        self.positions: Deque[Tuple[int, float, float, float]] = deque(maxlen=max(5, int(cfg.window_s * fps)))
+        self.total_frames = 0
+        self.walk_frames = 0
+        self.table_residency: Dict[int, int] = {}       # frames spent inside each zone
+        self.seated_by_table: Dict[int, int] = {}       # frames inside a zone AND still
+        self.assigned_table: Optional[int] = None
+        self.pending_table: Optional[int] = None
+        self.pending_count = 0
+        self.frames_outside = 0
+        self.state = "UNKNOWN"
+        self.last_seen_frame = 0
+        self.last_center: Tuple[float, float] = (0.0, 0.0)
 
-    def update(
-        self,
-        frame_idx: int,
-        cx: float,
-        cy: float,
-        current_table_id: Optional[int],
-        fps: float,
-        screen_scale: float,
-    ):
+    # helpers 
+    def _speed(self) -> float:
+        """Net speed over the window in body-heights per second (perspective independent)."""
+        if len(self.positions) < 5:
+            return 0.0
+        f0, x0, y0, _ = self.positions[0]
+        f1, x1, y1, _ = self.positions[-1]
+        dt = (f1 - f0) / self.fps
+        if dt <= 0:
+            return 0.0
+        h = float(np.median([p[3] for p in self.positions]))
+        return math.hypot(x1 - x0, y1 - y0) / max(h, 1.0) / dt
+
+    def adopt(self, old: "TrackAnalytics") -> None:
+        """Take over the history of a track whose ID was lost (tracker ID switch)."""
+        keep = self.track_id
+        self.__dict__.update(old.__dict__)
+        self.track_id = keep
+
+    # main update
+    def update(self, frame_idx: int, box: Tuple[float, float, float, float], table_id: Optional[int]) -> None:
+        x1, y1, x2, y2 = box
+        cx, cy, h = (x1 + x2) / 2.0, (y1 + y2) / 2.0, max(1.0, y2 - y1)
         self.last_seen_frame = frame_idx
+        self.last_center = (cx, cy)
         self.total_frames += 1
-        self.positions.append((frame_idx, cx, cy))
+        self.positions.append((frame_idx, cx, cy, h))
+        speed = self._speed()
+        fps, cfg = self.fps, self.cfg
 
-        # Table zone residency management with hysteresis
-        if current_table_id is not None:
-            self.table_residency[current_table_id] = self.table_residency.get(current_table_id, 0) + 1
-            if current_table_id == self.current_assigned_table:
-                self.consecutive_table_frames += 1
-                self.frames_since_in_zone = 0
+        # Zone assignment with hysteresis (all in seconds, so it is fps-independent)
+        if table_id is None:
+            self.frames_outside += 1
+            self.pending_table, self.pending_count = None, 0
+            if self.assigned_table is not None and self.frames_outside > max(3, int(cfg.release_s * fps)):
+                self.assigned_table = None
+        else:
+            self.frames_outside = 0
+            self.table_residency[table_id] = self.table_residency.get(table_id, 0) + 1
+            if table_id == self.assigned_table:
+                self.pending_table, self.pending_count = None, 0
             else:
-                # Switching or new assignment requires 6 consecutive frames to avoid jitter
-                if self.consecutive_table_frames >= 6 or self.current_assigned_table is None:
-                    self.current_assigned_table = current_table_id
-                    self.consecutive_table_frames = 1
-                self.frames_since_in_zone = 0
-        else:
-            self.frames_since_in_zone += 1
-            # Release table assignment after being absent for 15 frames
-            if self.frames_since_in_zone > 15:
-                self.current_assigned_table = None
-                self.consecutive_table_frames = 0
+                if table_id == self.pending_table:
+                    self.pending_count += 1
+                else:
+                    self.pending_table, self.pending_count = table_id, 1
+                need = cfg.assign_s if self.assigned_table is None else cfg.switch_s
+                if self.pending_count >= max(2, int(need * fps)):
+                    self.assigned_table = table_id
+                    self.pending_table, self.pending_count = None, 0
 
-        # Calculate recent velocity using sliding window (pixels per second normalized)
-        recent_speed_pps = 0.0
-        if len(self.positions) >= 5:
-            dt = (self.positions[-1][0] - self.positions[0][0]) / max(1.0, fps)
-            if dt > 0:
-                dist = np.hypot(
-                    self.positions[-1][1] - self.positions[0][1],
-                    self.positions[-1][2] - self.positions[0][2],
-                )
-                recent_speed_pps = dist / dt
+        # Behaviour evidence
+        if speed >= cfg.moving_speed:
+            self.walk_frames += 1
+        if table_id is not None and speed < cfg.still_speed:
+            self.seated_by_table[table_id] = self.seated_by_table.get(table_id, 0) + 1
 
-        is_moving_fast = recent_speed_pps > (screen_scale * 0.12)  # moving faster than 12% screen/sec
+        self._classify()
 
-        # 4-State Role Classification with temporal smoothing
-        if self.total_frames < 10:
-            self.state = "UNKNOWN"
-        else:
-            best_table = max(self.table_residency.items(), key=lambda x: x[1]) if self.table_residency else None
-            best_table_ratio = (best_table[1] / self.total_frames) if best_table else 0.0
+    def _classify(self) -> None:
+        cfg, fps = self.cfg, self.fps
+        total_s = self.total_frames / fps
+        seated_here_s = (
+            self.seated_by_table.get(self.assigned_table, 0) / fps if self.assigned_table is not None else 0.0
+        )
+        max_seated_s = max(self.seated_by_table.values(), default=0) / fps
 
-            if self.current_assigned_table is not None and not is_moving_fast and best_table_ratio >= 0.35:
-                self.state = "CUSTOMER"
-            elif is_moving_fast and best_table_ratio < 0.20:
+        if self.assigned_table is not None and seated_here_s >= cfg.customer_dwell_s:
+            self.state = "CUSTOMER"
+        elif self.state == "CUSTOMER":
+            pass  # customers stay customers while walking out
+        elif total_s >= cfg.staff_observe_s and max_seated_s < cfg.customer_dwell_s:
+            walk_ratio = self.walk_frames / max(1, self.total_frames)
+            visited = sum(1 for f in self.table_residency.values() if f >= 0.5 * fps)
+            if walk_ratio >= cfg.staff_walk_ratio or visited >= 2:
                 self.state = "STAFF"
-            elif self.total_frames >= 30 and best_table_ratio < 0.15:
-                self.state = "STAFF"
-            elif self.state == "UNKNOWN" and best_table_ratio >= 0.50:
-                self.state = "CUSTOMER"
 
 
-# =====================================================================
+def reclaim_lost_analytics(
+    analytics: Dict[int, TrackAnalytics],
+    new_ta: TrackAnalytics,
+    box: Tuple[float, float, float, float],
+    frame_idx: int,
+    active_ids: set,
+    fps: float,
+    cfg: AnalyticsConfig,
+) -> None:
+    """If a vanished track was last seen right where this new ID appeared, inherit its history."""
+    cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+    max_dist = 0.75 * max(1.0, box[3] - box[1])
+    best_id, best_dist = None, max_dist
+    for tid, old in analytics.items():
+        if tid in active_ids or old is new_ta:
+            continue
+        gap = frame_idx - old.last_seen_frame
+        if gap < 1 or gap > cfg.reclaim_s * fps:
+            continue
+        dist = math.hypot(old.last_center[0] - cx, old.last_center[1] - cy)
+        if dist <= best_dist:
+            best_id, best_dist = tid, dist
+    if best_id is not None:
+        new_ta.adopt(analytics.pop(best_id))
+
+
+
+# Drawing helpers
+
+def draw_badge(img, text: str, x: int, y: int, color, text_color=(0, 0, 0), scale: float = 0.42) -> None:
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    top = max(0, y - th - 6)
+    cv2.rectangle(img, (x, top), (x + tw + 4, top + th + 6), color, -1)
+    cv2.putText(img, text, (x + 2, top + th + 1), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 1, cv2.LINE_AA)
+
+
+
 # Main DineSight Pipeline
-# =====================================================================
+
+def _normalize_source(source: Source) -> Tuple[Union[str, int], bool]:
+    """Return (value for cv2.VideoCapture, is_live)."""
+    if isinstance(source, int):
+        return source, True
+    text = str(source)
+    if text.isdigit():
+        return int(text), True
+    if text.lower().startswith(("rtsp://", "rtmp://", "http://", "https://")):
+        return text, True
+    return text, False
+
+
 def run_dinesight_pipeline(
-    video_path: Path,
+    video_path: Source,
     output_path: Path,
     profile_name: Optional[str] = None,
     line_override: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
     entry_dir_override: Optional[str] = None,
+    model_path: str = MODEL_PATH,
+    conf: float = 0.10,
+    imgsz: int = 640,
+    auto_door: bool = True,
+    scan_seconds: float = 30.0,
+    write_video: bool = True,
+    report_path: Optional[Path] = None,
+    cfg: Optional[AnalyticsConfig] = None,
 ):
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path.resolve()}")
+    cfg = cfg or AnalyticsConfig()
+    cap_source, is_live = _normalize_source(video_path)
+    if not is_live and not Path(cap_source).exists():
+        raise FileNotFoundError(f"Video file not found: {Path(cap_source).resolve()}")
 
-    cap = cv2.VideoCapture(str(video_path))
+    cap = cv2.VideoCapture(cap_source)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path.resolve()}")
+        raise RuntimeError(f"Could not open video source: {cap_source}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or not math.isfinite(fps) or fps < 1:
+        fps = 25.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    screen_scale = max(width, height)
+    scale = max(width, height)
+    name_for_profile = Path("live") if is_live else Path(cap_source)
 
     print("=" * 70)
     print("DineSight: Unified Vision & Counting Analytics")
-    print(f"Input Video   : {video_path.resolve()}")
-    print(f"Resolution    : {width}x{height} @ {fps:.2f} fps ({total_frames} frames)")
-    print(f"Output Video  : {output_path.resolve()}")
+    print(f"Input         : {cap_source if is_live else Path(cap_source).resolve()}")
+    print(f"Resolution    : {width}x{height} @ {fps:.2f} fps ({total_frames if total_frames > 0 else 'live'} frames)")
+    if write_video:
+        print(f"Output Video  : {output_path.resolve()}")
 
-    model = YOLO(MODEL_PATH)
+    tracker_cfg = resolve_tracker_config()
+    # The tracking model is used ONLY for tracking. Discovery / scanning use their own
+    # instance so predict() calls cannot interfere with the tracker's state.
+    model = YOLO(model_path)
+    aux_model = YOLO(model_path)
 
-    # 1. Scene Profile Setup or Dynamic Discovery
-    doorway_line, entry_direction, tables = load_scene_profile(
-        profile_name, video_path, width, height
-    )
+    # 1. Scene profile, or dynamic discovery
+    doorway_line, entry_direction, tables = load_scene_profile(profile_name, name_for_profile, width, height)
+    entry_vector: Optional[Tuple[float, float]] = None
+    doorway_source = "profile" if doorway_line is not None else "auto"
+    doorway_confidence: Optional[float] = None
+    entry_source = "profile" if doorway_line is not None else "auto"
+    tables_source = "profile" if tables else "auto"
 
-    # Apply command-line overrides if provided
     if line_override:
         doorway_line = (
             (int(line_override[0][0] * width), int(line_override[0][1] * height)),
             (int(line_override[1][0] * width), int(line_override[1][1] * height)),
         )
+        doorway_source = "manual"
+        entry_source = "manual"
     elif doorway_line is None:
-        # Default doorway crossing line if none configured
-        doorway_line = (
-            (int(0.50 * width), int(0.10 * height)),
-            (int(0.50 * width), int(0.90 * height)),
-        )
+        estimate = None
+        if auto_door and not is_live:
+            print(f"[Setup] No doorway configured. Scanning the first {scan_seconds:.0f}s to locate the door...")
+            tracks = scan_tracks(Path(cap_source), model_path, tracker_cfg, fps, scan_seconds, conf, imgsz)
+            estimate = estimate_doorway(tracks, width, height, fps)
+        if estimate:
+            doorway_line = estimate["line"]
+            entry_vector = estimate["entry_vector"]
+            doorway_source = "auto"
+            doorway_confidence = float(estimate["confidence"])
+            entry_source = "auto"
+            print(
+                f"[Setup] Auto doorway from {estimate['endpoints']} track endpoints "
+                f"(flow confidence {estimate['confidence']:.2f}). Check the overlay, and pass "
+                f"--line / --entry-dir if it is wrong."
+            )
+        else:
+            doorway_line = (
+                (int(0.50 * width), int(0.10 * height)),
+                (int(0.50 * width), int(0.90 * height)),
+            )
+            doorway_source = "fallback"
+            entry_source = "default"
+            print("[Setup Warning] Could not estimate a doorway: using a centred vertical line. "
+                  "Pass --line and --entry-dir for reliable counts.")
 
     if entry_dir_override:
-        entry_direction = entry_dir_override
+        entry_direction, entry_vector = entry_dir_override, None
+        entry_source = "manual"
 
-    # Dynamic table discovery fallback if no tables in profile
     if not tables:
         print("[Setup] No pre-defined tables. Running dynamic table auto-discovery...")
-        tables = discover_tables_dynamically(cap, model, width, height)
+        tables = discover_tables_dynamically(sample_video_frames(cap), aux_model, width, height)
+        tables_source = "auto"
         print(f"[Setup] Discovered {len(tables)} dynamic table zones.")
     else:
+        tables_source = "profile"
         print(f"[Setup] Active Table Zones: {len(tables)}")
 
-    print(f"[Setup] Counting Line: {doorway_line[0]} -> {doorway_line[1]} ({entry_direction})")
+    shown_dir = f"vector=({entry_vector[0]:+.2f},{entry_vector[1]:+.2f})" if entry_vector else entry_direction
+    print(f"[Setup] Counting Line: {doorway_line[0]} -> {doorway_line[1]} (entry: {shown_dir})")
     print("=" * 70)
 
-    # Initialize the Unified Counter facade from count.py
+    tolerance_px = max(18, int(width * 0.025))
     counter = DineSightCounter(
         line_start=doorway_line[0],
         line_end=doorway_line[1],
         entry_direction=entry_direction,
-        tolerance_px=max(18, int(width * 0.025)),
-        cooldown_frames=12,
-        stale_after_frames=90,
+        tolerance_px=tolerance_px,
+        cooldown_frames=max(6, int(0.5 * fps)),
+        stale_after_frames=max(30, int(3 * fps)),
         tables=tables,
+        dead_band_px=max(6, int(tolerance_px * 0.5)),
+        entry_vector=entry_vector,
+        reid_window_frames=max(8, int(2 * fps)),
+        reid_distance_px=max(30.0, 0.06 * scale),
+        table_hold_frames=max(3, int(0.8 * fps)),
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-    )
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Could not create output video: {output_path.resolve()}")
+    writer = None
+    if write_video:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not create output video: {output_path.resolve()}")
 
     track_analytics: Dict[int, TrackAnalytics] = {}
+    flashes: List[Tuple[str, Tuple[int, int, int], Tuple[int, int], int]] = []
+    table_summary = counter.evaluate_tables({})
+    customers_estimated = staff_estimated = unknown_people = 0
     frame_idx = 0
+
+    # Run-level bookkeeping for the JSON report / dashboard.
+    seen_track_ids: set = set()
+    customer_track_ids: set = set()
+    staff_track_ids: set = set()
+    active_track_ids: set = set()
+    table_peak: Dict[int, int] = {t["id"]: 0 for t in tables}
+    table_visitors: Dict[int, set] = {t["id"]: set() for t in tables}
+    occupancy_history: List[Dict] = []
+    next_sample_frame = 0
 
     try:
         while True:
@@ -369,134 +762,149 @@ def run_dinesight_pipeline(
             if not ok:
                 break
 
-            results = model.track(
+            result = model.track(
                 frame,
                 persist=True,
-                tracker=TRACKER_CONFIG if Path(TRACKER_CONFIG).exists() else "bytetrack.yaml",
-                classes=[0],
-                conf=0.20,
+                tracker=tracker_cfg,
+                classes=[PERSON],
+                conf=conf,
+                imgsz=imgsz,
                 verbose=False,
-            )
-            result = results[0]
+            )[0]
             annotated = frame.copy()
 
-            boxes = []
-            ids = []
+            boxes, ids = [], []
             if result.boxes is not None and result.boxes.id is not None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 ids = result.boxes.id.int().cpu().tolist()
 
-            # Person detection mapping
             active_track_ids = set(ids)
             table_occupants: Dict[int, List[int]] = {t["id"]: [] for t in tables}
-            customers_estimated = 0
-            staff_estimated = 0
-            unknown_people = 0
+            customers_estimated = staff_estimated = unknown_people = 0
 
-            # Periodic cleanup of stale tracks from memory
+            # Periodic cleanup of stale tracks
             if frame_idx % 60 == 0:
                 counter.cleanup_stale_tracks(frame_idx)
                 stale_ids = [
                     tid for tid, ta in track_analytics.items()
-                    if frame_idx - ta.last_seen_frame > 120
+                    if frame_idx - ta.last_seen_frame > max(120, int((cfg.reclaim_s + 2) * fps))
+                    and tid not in active_track_ids
                 ]
                 for tid in stale_ids:
                     del track_analytics[tid]
 
             for box, tid in zip(boxes, ids):
                 x1, y1, x2, y2 = [int(v) for v in box]
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                cx = (x1 + x2) // 2
                 foot = (cx, y2)
 
-                # 1. Update doorway crossing counter (handled in count.py)
-                counter.update_doorway(tid, foot, frame_idx)
+                # 1. Doorway crossing (count.py)
+                event = counter.update_doorway(tid, foot, frame_idx)
+                if event:
+                    kind = event[0]
+                    flashes.append((kind, (0, 255, 0) if kind == "ENTRY" else (0, 0, 255), foot, frame_idx + int(fps)))
 
-                # 2. Check candidate table zone
-                candidate_table_id = None
-                for t in tables:
-                    bx1, by1, bx2, by2 = t["box"]
-                    if bx1 <= cx <= bx2 and by1 <= cy <= by2:
-                        candidate_table_id = t["id"]
-                        break
+                # 2. Table zone for this person
+                candidate_table_id = pick_table_zone((x1, y1, x2, y2), tables)
 
-                # 3. Update track analytics & classification
-                if tid not in track_analytics:
-                    track_analytics[tid] = TrackAnalytics(tid)
+                # 3. Behaviour analytics + classification
+                ta = track_analytics.get(tid)
+                if ta is None:
+                    ta = TrackAnalytics(tid, fps, cfg)
+                    reclaim_lost_analytics(track_analytics, ta, (x1, y1, x2, y2), frame_idx, active_track_ids, fps, cfg)
+                    track_analytics[tid] = ta
+                    seen_track_ids.add(tid)
+                ta.update(frame_idx, (x1, y1, x2, y2), candidate_table_id)
 
-                ta = track_analytics[tid]
-                ta.update(frame_idx, cx, cy, candidate_table_id, fps, screen_scale)
+                if ta.state == "CUSTOMER":
+                    customer_track_ids.add(tid)
+                elif ta.state == "STAFF":
+                    staff_track_ids.add(tid)
 
-                # Assign person to table if confirmed customer
-                if ta.state == "CUSTOMER" and ta.current_assigned_table is not None:
-                    table_occupants[ta.current_assigned_table].append(tid)
+                if ta.state == "CUSTOMER":
                     customers_estimated += 1
-                    role_label = f"Customer #{tid} (T{ta.current_assigned_table})"
-                    box_color = (255, 180, 0)  # Cyan/Blue
+                    if ta.assigned_table is not None:
+                        table_occupants[ta.assigned_table].append(tid)
+                        role_label = f"Customer #{tid} (T{ta.assigned_table})"
+                    else:
+                        role_label = f"Customer #{tid}"
+                    box_color = (255, 180, 0)
                 elif ta.state == "STAFF":
                     staff_estimated += 1
                     role_label = f"Staff #{tid}"
-                    box_color = (0, 215, 255)  # Gold/Yellow
+                    box_color = (0, 215, 255)
                 else:
                     unknown_people += 1
                     role_label = f"Person #{tid}"
-                    box_color = (180, 180, 180)  # Neutral grey for UNKNOWN
+                    box_color = (180, 180, 180)
 
-                # Draw bounding box & badge
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
-                (tw, th), _ = cv2.getTextSize(role_label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-                cv2.rectangle(annotated, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, max(th + 6, y1)), box_color, -1)
-                cv2.putText(
-                    annotated,
-                    role_label,
-                    (x1 + 2, max(th + 2, y1 - 3)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
+                draw_badge(annotated, role_label, x1, y1, box_color)
 
-            # 4. Evaluate Table Statuses via count.py
-            table_summary = counter.evaluate_tables(table_occupants)
+            # 4. Table statuses
+            table_summary = counter.evaluate_tables(table_occupants, frame_idx)
             empty_tables = table_summary["empty_tables"]
             occupied_tables = table_summary["occupied_tables"]
             full_tables = table_summary["full_tables"]
 
-            # Render Table Boxes
+            for t_id, t_info in table_summary["table_statuses"].items():
+                table_peak[t_id] = max(table_peak.get(t_id, 0), t_info["count"])
+                if t_info["seated_ids"]:
+                    table_visitors.setdefault(t_id, set()).update(t_info["seated_ids"])
+
+            if frame_idx >= next_sample_frame:
+                occupancy_history.append({
+                    "frame": frame_idx,
+                    "time_s": round(frame_idx / fps, 2),
+                    "seated": sum(t["count"] for t in table_summary["table_statuses"].values()),
+                    "occupied_tables": len(occupied_tables) + len(full_tables),
+                    "empty_tables": len(empty_tables),
+                    "tables": {
+                        t_id: info["count"]
+                        for t_id, info in table_summary["table_statuses"].items()
+                    },
+                })
+                next_sample_frame = frame_idx + max(1, int(round(fps)))
+
             for t in tables:
                 bx1, by1, bx2, by2 = t["box"]
                 t_info = table_summary["table_statuses"][t["id"]]
-                count_val = t_info["count"]
-                cap_val = t_info["capacity"]
-                status_str = t_info["status"]
-
+                count_val, cap_val, status_str = t_info["count"], t_info["capacity"], t_info["status"]
                 if status_str == "EMPTY":
-                    t_color = (0, 255, 0)
-                    badge = f"{t['name']}: EMPTY (0/{cap_val})"
+                    t_color, badge = (0, 255, 0), f"{t['name']}: EMPTY (0/{cap_val})"
                 elif status_str == "FULL":
-                    t_color = (0, 0, 255)
-                    badge = f"{t['name']}: FULL ({count_val}/{cap_val})"
+                    t_color, badge = (0, 0, 255), f"{t['name']}: FULL ({count_val}/{cap_val})"
                 else:
-                    t_color = (0, 165, 255)
-                    badge = f"{t['name']}: OCCUPIED ({count_val}/{cap_val})"
-
+                    t_color, badge = (0, 165, 255), f"{t['name']}: OCCUPIED ({count_val}/{cap_val})"
                 cv2.rectangle(annotated, (bx1, by1), (bx2, by2), t_color, 2)
-                (stw, sth), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
-                cv2.rectangle(annotated, (bx1, by1), (bx1 + stw + 6, by1 + sth + 8), (20, 20, 20), -1)
-                cv2.putText(annotated, badge, (bx1 + 3, by1 + sth + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.40, t_color, 1, cv2.LINE_AA)
+                draw_badge(annotated, badge, bx1, by1 + 22, (20, 20, 20), t_color, 0.40)
 
-            # Render Doorway Line
+            # Doorway line + entry arrow
             cv2.line(annotated, doorway_line[0], doorway_line[1], (255, 255, 0), 3)
             cv2.circle(annotated, doorway_line[0], 6, (0, 255, 255), -1)
             cv2.circle(annotated, doorway_line[1], 6, (0, 255, 255), -1)
-            line_mid = ((doorway_line[0][0] + doorway_line[1][0]) // 2, (doorway_line[0][1] + doorway_line[1][1]) // 2)
-            cv2.putText(annotated, "DOORWAY", (line_mid[0] + 6, line_mid[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+            line_mid = (
+                (doorway_line[0][0] + doorway_line[1][0]) // 2,
+                (doorway_line[0][1] + doorway_line[1][1]) // 2,
+            )
+            vec = entry_vector or {
+                "left_to_right": (1.0, 0.0), "right_to_left": (-1.0, 0.0),
+                "top_to_bottom": (0.0, 1.0), "bottom_to_top": (0.0, -1.0),
+            }.get(entry_direction, (1.0, 0.0))
+            vn = math.hypot(vec[0], vec[1]) or 1.0
+            arrow_end = (int(line_mid[0] + vec[0] / vn * 45), int(line_mid[1] + vec[1] / vn * 45))
+            cv2.arrowedLine(annotated, line_mid, arrow_end, (0, 255, 0), 2, tipLength=0.35)
+            cv2.putText(annotated, "DOORWAY (arrow = ENTRY)", (line_mid[0] + 6, line_mid[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
 
-            # 5. Render Explicit Metrics HUD
+            flashes = [f for f in flashes if f[3] >= frame_idx]
+            for text, color, pos, _ in flashes:
+                cv2.putText(annotated, f"{text} +1", (pos[0] + 8, max(20, pos[1] - 30)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+            # 5. HUD
             doorway_stats = counter.get_summary()
-            entries = doorway_stats["entries"]
-            exits = doorway_stats["exits"]
-            net_change = doorway_stats["net_change"]
+            entries, exits, net_change = doorway_stats["entries"], doorway_stats["exits"], doorway_stats["net_change"]
 
             hud_w, hud_h = max(360, int(width * 0.42)), 175
             overlay = annotated.copy()
@@ -512,22 +920,27 @@ def run_dinesight_pipeline(
             empty_list_str = f"Empty Tables  : {', '.join(empty_tables[:3])}" if empty_tables else "Empty Tables  : None"
             cv2.putText(annotated, empty_list_str, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1, cv2.LINE_AA)
 
-            writer.write(annotated)
+            if writer is not None:
+                writer.write(annotated)
             frame_idx += 1
 
             if frame_idx % 75 == 0 or frame_idx == total_frames:
                 print(
-                    f"Frame {frame_idx:3d}/{total_frames}: "
+                    f"Frame {frame_idx:4d}/{total_frames if total_frames > 0 else '?'}: "
                     f"Entries={entries}, Exits={exits}, Net={net_change:+d} | "
                     f"Cust={customers_estimated}, Staff={staff_estimated}, Unk={unknown_people} | "
                     f"Empty Tables={len(empty_tables)}"
                 )
-
+    except KeyboardInterrupt:
+        print("\n[Interrupted] Stopping and writing the summary...")
     finally:
         cap.release()
-        writer.release()
+        if writer is not None:
+            writer.release()
 
     final_stats = counter.get_summary()
+    empty_tables = table_summary["empty_tables"]
+    occupied_total = len(table_summary["occupied_tables"]) + len(table_summary["full_tables"])
     print("\n" + "=" * 70)
     print("DineSight Analysis Complete")
     print(f"Total Processed Frames : {frame_idx}")
@@ -536,9 +949,71 @@ def run_dinesight_pipeline(
     print(f"Net Change             : {final_stats['net_change']:+d}")
     print(f"Total Tables Monitored : {len(tables)}")
     print(f"Empty Tables Count     : {len(empty_tables)} -> {empty_tables}")
-    print(f"Occupied Tables Count  : {len(occupied_tables) + len(full_tables)}")
-    print(f"Output Video Saved     : {output_path.resolve()}")
+    print(f"Occupied Tables Count  : {occupied_total}")
+    print(f"Unique Track IDs       : {len(seen_track_ids)}")
+    print(f"Customers / Staff      : {len(customer_track_ids)} / {len(staff_track_ids)}")
+    print(f"Unknown / Visible Now  : {len(seen_track_ids - customer_track_ids - staff_track_ids)} / {len(active_track_ids)}")
+    if write_video:
+        print(f"Output Video Saved     : {output_path.resolve()}")
     print("=" * 70)
+
+    if report_path is not None:
+        table_report = {}
+        for t_id, info in table_summary["table_statuses"].items():
+            table_report[str(t_id)] = {
+                **info,
+                "peak_count": table_peak.get(t_id, 0),
+                "unique_seated_ids": sorted(table_visitors.get(t_id, set())),
+            }
+        line_normalized = [
+            [round(doorway_line[0][0] / width, 4), round(doorway_line[0][1] / height, 4)],
+            [round(doorway_line[1][0] / width, 4), round(doorway_line[1][1] / height, 4)],
+        ]
+        report = {
+            "frames": frame_idx,
+            "fps": round(fps, 3),
+            "duration_s": round(frame_idx / fps, 2) if fps else 0,
+            "resolution": {"width": width, "height": height},
+            "source": str(video_path),
+            "entries": final_stats["entries"],
+            "exits": final_stats["exits"],
+            "net_change": final_stats["net_change"],
+            "doorway_line": [list(doorway_line[0]), list(doorway_line[1])],
+            "doorway_line_normalized": line_normalized,
+            "entry": list(entry_vector) if entry_vector else entry_direction,
+            "scene": {
+                "profile": profile_name or "automatic",
+                "doorway_source": doorway_source,
+                "doorway_confidence": doorway_confidence,
+                "entry_source": entry_source,
+                "tables_source": tables_source,
+                "table_count": len(tables),
+            },
+            "classification": {
+                "unique_track_ids": len(seen_track_ids),
+                "customers": len(customer_track_ids),
+                "staff": len(staff_track_ids),
+                "unknown": len(seen_track_ids - customer_track_ids - staff_track_ids),
+                "visible_at_end": len(active_track_ids),
+            },
+            "table_summary": {
+                "total_tables": len(tables),
+                "empty": len(empty_tables),
+                "occupied": len(occupied_tables),
+                "full": len(full_tables),
+                "total_seated": sum(t["count"] for t in table_summary["table_statuses"].values()),
+                "empty_tables": empty_tables,
+                "occupied_tables": occupied_tables,
+                "full_tables": full_tables,
+            },
+            "tables": table_report,
+            "occupancy_history": occupancy_history,
+            "events": [dict(e, time_s=round(e["frame"] / fps, 2)) for e in counter.get_events()],
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+        print(f"Report saved           : {report_path.resolve()}")
 
 
 # =====================================================================
@@ -546,24 +1021,50 @@ def run_dinesight_pipeline(
 # =====================================================================
 def main():
     parser = argparse.ArgumentParser(description="DineSight Unified Vision Analytics")
-    parser.add_argument("video_path", nargs="?", default=str(DEFAULT_VIDEO), help="Input video file path")
+    parser.add_argument("video_path", nargs="?", default=str(DEFAULT_VIDEO),
+                        help="Input video file, webcam index (0), or rtsp:// URL")
     parser.add_argument("output_path", nargs="?", default=str(DEFAULT_OUTPUT), help="Output video file path")
     parser.add_argument("--profile", default=None, help="Scene profile name or JSON path (e.g. 'case', 'test2', 'test')")
     parser.add_argument("--line", default=None, help="Doorway line normalized 'x1,y1,x2,y2' (0.0 to 1.0)")
-    parser.add_argument("--entry-dir", default=None, choices=["left_to_right", "right_to_left"], help="Entry direction across line")
+    parser.add_argument("--entry-dir", default=None, choices=VALID_DIRECTIONS, help="Direction of travel that counts as ENTRY")
+    parser.add_argument("--model", default=MODEL_PATH, help="YOLO weights (yolo11s.pt / yolo11m.pt are more accurate)")
+    parser.add_argument("--conf", type=float, default=0.10, help="Detector confidence (ByteTrack needs low-score boxes)")
+    parser.add_argument("--imgsz", type=int, default=640, help="Inference size (960 or 1280 helps small/far people)")
+    parser.add_argument("--no-auto-door", action="store_true", help="Do not estimate the doorway from trajectories")
+    parser.add_argument("--scan-seconds", type=float, default=30.0, help="How much video to scan for the doorway")
+    parser.add_argument("--no-video", action="store_true", help="Skip writing the annotated video (faster)")
+    parser.add_argument("--report", default=None, help="Write a JSON report (counts, tables, event log) to this path")
+    parser.add_argument("--customer-dwell", type=float, default=None, help="Seconds seated at a table to count as a customer")
+    parser.add_argument("--staff-observe", type=float, default=None, help="Seconds on screen before a walker can be labelled staff")
     args = parser.parse_args()
 
     line_override = None
     if args.line:
         coords = [float(v) for v in args.line.split(",")]
+        if len(coords) != 4:
+            parser.error("--line needs 4 comma-separated numbers: x1,y1,x2,y2")
         line_override = ((coords[0], coords[1]), (coords[2], coords[3]))
 
+    cfg = AnalyticsConfig()
+    if args.customer_dwell is not None:
+        cfg.customer_dwell_s = args.customer_dwell
+    if args.staff_observe is not None:
+        cfg.staff_observe_s = args.staff_observe
+
     run_dinesight_pipeline(
-        video_path=Path(args.video_path),
+        video_path=args.video_path,
         output_path=Path(args.output_path),
         profile_name=args.profile,
         line_override=line_override,
         entry_dir_override=args.entry_dir,
+        model_path=args.model,
+        conf=args.conf,
+        imgsz=args.imgsz,
+        auto_door=not args.no_auto_door,
+        scan_seconds=args.scan_seconds,
+        write_video=not args.no_video,
+        report_path=Path(args.report) if args.report else None,
+        cfg=cfg,
     )
 
 
