@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import copy
 import math
 import sys
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple, Union
 
@@ -32,18 +33,19 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 try:
-    from count import DineSightCounter
+    from count import DineSightCounter, signed_side, distance_to_segment
 except ImportError:
-    from src.count import DineSightCounter
+    from src.count import DineSightCounter, signed_side, distance_to_segment
 
 # Configuration Defaults
 DEFAULT_VIDEO = Path("videos/case.mp4")
 DEFAULT_OUTPUT = Path("videos/detected_case.mp4")
-MODEL_PATH = "yolo11n.pt"
+MODEL_PATH = "yolo11s.pt"
 TRACKER_CONFIG = "bytetrack_custom.yaml"
 PROFILES_DIR = Path("profiles")
 
 PERSON, CHAIR, TABLE = 0, 56, 60  # COCO class ids
+SPAWN_ENTRY = True  # count people first detected inside the door zone (disable with --no-spawn-entry)
 VALID_DIRECTIONS = ["left_to_right", "right_to_left", "top_to_bottom", "bottom_to_top"]
 
 Source = Union[str, int, Path]
@@ -117,6 +119,129 @@ def load_scene_profile(
 
     return line, entry_direction, tables
 
+
+def _find_profile_path(profile_name_or_path: Optional[str], video_path: Path) -> Optional[Path]:
+    """Same lookup order as load_scene_profile, but only returns the file path."""
+    if profile_name_or_path:
+        p_path = Path(profile_name_or_path)
+        if not p_path.exists():
+            p_path = PROFILES_DIR / f"{profile_name_or_path}.json"
+        if p_path.exists():
+            return p_path
+    candidate = PROFILES_DIR / f"{video_path.stem.lower()}.json"
+    return candidate if candidate.exists() else None
+
+
+def load_profile_analytics(profile_name_or_path: Optional[str], video_path: Path) -> Dict[str, float]:
+    """
+    Per-camera classification settings from the profile's optional "analytics" block, e.g.
+
+        "analytics": {"staff_observe_s": 8, "customer_dwell_s": 4, "warmup_s": 5}
+
+    Only AnalyticsConfig field names with non-negative numbers are accepted; anything else is
+    ignored with a warning, so a typo in a profile never crashes a run.
+    """
+    path = _find_profile_path(profile_name_or_path, video_path)
+    if path is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = (json.load(f) or {}).get("analytics")
+    except (OSError, ValueError):
+        return {}
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        print(f"[Config Warning] 'analytics' in {path.name} must be an object: ignored.")
+        return {}
+    valid = {f.name for f in dataclass_fields(AnalyticsConfig)}
+    out: Dict[str, float] = {}
+    for key, value in raw.items():
+        if key not in valid:
+            print(f"[Config Warning] Unknown analytics setting '{key}' in {path.name}: ignored "
+                  f"(valid: {', '.join(sorted(valid))}).")
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            print(f"[Config Warning] Analytics setting '{key}' in {path.name} must be a number >= 0: ignored.")
+        else:
+            out[key] = float(value)
+    return out
+
+
+
+# Staff uniform colour (optional, per camera / profile)
+
+@dataclass
+class UniformConfig:
+    """Staff uniform colour(s) in OpenCV HSV (H 0-179, S/V 0-255), sampled by clicking on a staff member."""
+    samples: List[Tuple[float, float, float]]
+    hue_tol: float = 12.0        # circular hue distance (ignored for grey/black/white samples)
+    sat_tol: float = 70.0
+    val_tol: float = 70.0
+    pixel_ratio: float = 0.30    # share of torso pixels that must match for one observation to count as a hit
+    min_samples: int = 8         # observations needed before a track can be judged
+    confirm_ratio: float = 0.6   # share of hits that confirms STAFF
+    strict: bool = False         # True: once judged "no match", behaviour alone can no longer label STAFF
+
+
+def load_profile_uniform(profile_name_or_path: Optional[str], video_path: Path) -> Optional[UniformConfig]:
+    """Reads the optional "staff_uniform" block of the profile; invalid input is ignored with a warning."""
+    path = _find_profile_path(profile_name_or_path, video_path)
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = (json.load(f) or {}).get("staff_uniform")
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        print(f"[Config Warning] 'staff_uniform' in {path.name} must be an object: ignored.")
+        return None
+    samples: List[Tuple[float, float, float]] = []
+    for item in raw.get("samples", []):
+        ok = (
+            isinstance(item, (list, tuple)) and len(item) == 3
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in item)
+            and 0 <= item[0] <= 179 and 0 <= item[1] <= 255 and 0 <= item[2] <= 255
+        )
+        if ok:
+            samples.append((float(item[0]), float(item[1]), float(item[2])))
+        else:
+            print(f"[Config Warning] Bad uniform sample {item!r} in {path.name}: ignored (need [H 0-179, S 0-255, V 0-255]).")
+    if not samples:
+        return None
+    cfg = UniformConfig(samples=samples[:6])
+    for key in ("hue_tol", "sat_tol", "val_tol", "pixel_ratio", "confirm_ratio"):
+        if isinstance(raw.get(key), (int, float)) and not isinstance(raw.get(key), bool) and raw[key] >= 0:
+            setattr(cfg, key, float(raw[key]))
+    if isinstance(raw.get("min_samples"), int) and raw["min_samples"] >= 1:
+        cfg.min_samples = raw["min_samples"]
+    cfg.strict = bool(raw.get("strict", False))
+    return cfg
+
+
+def uniform_match_ratio(frame: np.ndarray, box: Tuple[float, float, float, float], uni: UniformConfig) -> Optional[float]:
+    """Share (0-1) of the person's torso pixels that are close to a uniform sample; None if the box is too small."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if w < 8 or h < 16:
+        return None
+    H, W = frame.shape[:2]
+    rx1, rx2 = max(0, int(x1 + 0.25 * w)), min(W, int(x2 - 0.25 * w))
+    ry1, ry2 = max(0, int(y1 + 0.20 * h)), min(H, int(y1 + 0.55 * h))   # chest / torso band
+    if rx2 - rx1 < 4 or ry2 - ry1 < 4:
+        return None
+    hsv = cv2.cvtColor(frame[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2HSV).astype(np.int16)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    mask = np.zeros(hue.shape, dtype=bool)
+    for sh, ss, sv in uni.samples:
+        m = (np.abs(sat - ss) <= uni.sat_tol) & (np.abs(val - sv) <= uni.val_tol)
+        if ss >= 40:   # coloured sample: hue matters (circular); grey/black/white: hue is noise
+            dh = np.abs(hue - sh)
+            m &= np.minimum(dh, 180 - dh) <= uni.hue_tol
+        mask |= m
+    return float(mask.mean())
 
 
 # Geometry helpers
@@ -449,11 +574,18 @@ class AnalyticsConfig:
     assign_s: float = 0.4           # time inside a zone before it is assigned
     switch_s: float = 1.0           # time inside ANOTHER zone before switching
     release_s: float = 1.5          # time outside every zone before releasing
-    customer_dwell_s: float = 8.0   # seated time at one table that makes a CUSTOMER
-    staff_observe_s: float = 20.0   # minimum time on screen before judging STAFF
-    staff_walk_ratio: float = 0.35  # share of time walking that marks STAFF
+    customer_dwell_s: float = 5.0   # seated time at one table that makes a CUSTOMER
+    settled_s: float = 2.0          # still time at a table after which a person already counts toward table occupancy
+    staff_observe_s: float = 6.0    # minimum time on screen before judging STAFF (was 20 s: a waiter passing for ~8 s was never labelled)
+    staff_walk_ratio: float = 0.5   # share of time walking that marks STAFF
+    staff_min_walk_s: float = 3.0   # absolute walking time required (a customer who just arrived and sat down has little)
+    warmup_s: float = 3.0           # start-up phase: people already seated when the video starts are recognised faster
+    initial_settled_s: float = 0.8  # settled_s used for people present at video start
+    initial_dwell_s: float = 2.0    # customer_dwell_s used for people present at video start
     window_s: float = 1.5           # sliding window for speed
-    reclaim_s: float = 4.0          # how long a vanished track may be re-adopted
+    reclaim_s: float = 4.0          # how long a vanished (walking) track may be re-adopted
+    seated_reclaim_s: float = 90.0  # how long a vanished CUSTOMER may be re-adopted (occlusion by chair/table/people)
+    seated_reclaim_scale: float = 1.0  # search radius for a seated customer, in body-heights
 
 
 class TrackAnalytics:
@@ -465,10 +597,14 @@ class TrackAnalytics:
                   or moves between tables
     """
 
-    def __init__(self, track_id: int, fps: float, cfg: AnalyticsConfig):
+    def __init__(self, track_id: int, fps: float, cfg: AnalyticsConfig, uniform: Optional[UniformConfig] = None):
         self.track_id = track_id
         self.fps = fps
         self.cfg = cfg
+        self.uniform = uniform
+        self.uni_n = 0            # uniform observations
+        self.uni_hits = 0         # observations whose torso matched the uniform colour
+        self._uni_last_frame = -10**9
         self.positions: Deque[Tuple[int, float, float, float]] = deque(maxlen=max(5, int(cfg.window_s * fps)))
         self.total_frames = 0
         self.walk_frames = 0
@@ -481,6 +617,15 @@ class TrackAnalytics:
         self.state = "UNKNOWN"
         self.last_seen_frame = 0
         self.last_center: Tuple[float, float] = (0.0, 0.0)
+        self.last_box: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        self.first_frame = 0
+        self.initial = False  # present during the start-up phase (already seated when the video began)
+
+    def _settled_s(self) -> float:
+        return self.cfg.initial_settled_s if self.initial else self.cfg.settled_s
+
+    def _dwell_s(self) -> float:
+        return self.cfg.initial_dwell_s if self.initial else self.cfg.customer_dwell_s
 
     # helpers 
     def _speed(self) -> float:
@@ -495,18 +640,54 @@ class TrackAnalytics:
         h = float(np.median([p[3] for p in self.positions]))
         return math.hypot(x1 - x0, y1 - y0) / max(h, 1.0) / dt
 
+    def observe_uniform(self, frame: np.ndarray, box: Tuple[float, float, float, float], frame_idx: int) -> None:
+        """Sample the torso colour (about 5 times per second) and update the uniform evidence."""
+        if self.uniform is None or frame_idx - self._uni_last_frame < max(1, int(round(self.fps / 5.0))):
+            return
+        self._uni_last_frame = frame_idx
+        ratio = uniform_match_ratio(frame, box, self.uniform)
+        if ratio is None:
+            return
+        self.uni_n += 1
+        if ratio >= self.uniform.pixel_ratio:
+            self.uni_hits += 1
+
+    def uniform_status(self) -> str:
+        """'match' / 'no_match' / 'unknown' (no uniform configured or too little evidence)."""
+        u = self.uniform
+        if u is None or self.uni_n < u.min_samples:
+            return "unknown"
+        share = self.uni_hits / self.uni_n
+        if share >= u.confirm_ratio:
+            return "match"
+        if share <= 0.2 and self.uni_n >= int(1.5 * u.min_samples):
+            return "no_match"
+        return "unknown"
+
+    def is_settled(self) -> bool:
+        """Sitting still inside an assigned table zone long enough to count as seated (before CUSTOMER)."""
+        if self.assigned_table is None:
+            return False
+        if self._speed() >= self.cfg.moving_speed:  # walking away from the table: not seated any more
+            return False
+        return self.seated_by_table.get(self.assigned_table, 0) / self.fps >= self._settled_s()
+
     def adopt(self, old: "TrackAnalytics") -> None:
         """Take over the history of a track whose ID was lost (tracker ID switch)."""
         keep = self.track_id
-        self.__dict__.update(old.__dict__)
+        self.__dict__.update(copy.deepcopy(old.__dict__))
         self.track_id = keep
 
     # main update
     def update(self, frame_idx: int, box: Tuple[float, float, float, float], table_id: Optional[int]) -> None:
         x1, y1, x2, y2 = box
         cx, cy, h = (x1 + x2) / 2.0, (y1 + y2) / 2.0, max(1.0, y2 - y1)
+        if self.total_frames == 0:  # very first observation of this person
+            self.first_frame = frame_idx
+            self.initial = frame_idx <= int(self.cfg.warmup_s * self.fps)
         self.last_seen_frame = frame_idx
         self.last_center = (cx, cy)
+        self.last_box = (x1, y1, x2, y2)
         self.total_frames += 1
         self.positions.append((frame_idx, cx, cy, h))
         speed = self._speed()
@@ -544,20 +725,46 @@ class TrackAnalytics:
     def _classify(self) -> None:
         cfg, fps = self.cfg, self.fps
         total_s = self.total_frames / fps
+        dwell_s = self._dwell_s()
         seated_here_s = (
             self.seated_by_table.get(self.assigned_table, 0) / fps if self.assigned_table is not None else 0.0
         )
         max_seated_s = max(self.seated_by_table.values(), default=0) / fps
+        uni = self.uniform_status()
 
-        if self.assigned_table is not None and seated_here_s >= cfg.customer_dwell_s:
+        if uni == "match":
+            self.state = "STAFF"   # the uniform is stronger evidence than behaviour (also when a waiter sits down)
+        elif self.assigned_table is not None and seated_here_s >= dwell_s:
             self.state = "CUSTOMER"
         elif self.state == "CUSTOMER":
             pass  # customers stay customers while walking out
-        elif total_s >= cfg.staff_observe_s and max_seated_s < cfg.customer_dwell_s:
+        elif total_s >= cfg.staff_observe_s and max_seated_s < dwell_s:
+            # Someone who is sitting/standing still at a table right now is a customer-in-progress,
+            # not staff (a new arrival walks for a few seconds first and then sits down).
+            at_table_now = self.assigned_table is not None and self._speed() < cfg.moving_speed
+            walk_s = self.walk_frames / fps
             walk_ratio = self.walk_frames / max(1, self.total_frames)
             visited = sum(1 for f in self.table_residency.values() if f >= 0.5 * fps)
-            if walk_ratio >= cfg.staff_walk_ratio or visited >= 2:
+            walks_a_lot = walk_ratio >= cfg.staff_walk_ratio or (visited >= 2 and walk_ratio >= 0.3)
+            strict_block = uni == "no_match" and self.uniform is not None and self.uniform.strict
+            if not at_table_now and walk_s >= cfg.staff_min_walk_s and walks_a_lot and not strict_block:
                 self.state = "STAFF"
+
+
+def _overlap_share(a, b) -> float:
+    """Overlap area as a share of the SMALLER box (used to find table zones that overlap)."""
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return (ix * iy) / smaller if smaller > 0 else 0.0
+
+
+def _box_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = max(1.0, (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / union
 
 
 def reclaim_lost_analytics(
@@ -568,22 +775,55 @@ def reclaim_lost_analytics(
     active_ids: set,
     fps: float,
     cfg: AnalyticsConfig,
-) -> None:
+    table_id: Optional[int] = None,
+    door_zone=None,
+) -> Optional[int]:
     """If a vanished track was last seen right where this new ID appeared, inherit its history."""
     cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
-    max_dist = 0.75 * max(1.0, box[3] - box[1])
-    best_id, best_dist = None, max_dist
+    h = max(1.0, box[3] - box[1])
+    best_id, best_score = None, float("inf")
     for tid, old in analytics.items():
         if tid in active_ids or old is new_ta:
             continue
         gap = frame_idx - old.last_seen_frame
-        if gap < 1 or gap > cfg.reclaim_s * fps:
+        seated_customer = old.state == "CUSTOMER" and old.assigned_table is not None
+        # A seated customer who vanishes is almost always an occlusion / missed detection,
+        # not someone who left -> remember them much longer and search a wider area.
+        max_gap = (cfg.seated_reclaim_s if seated_customer else cfg.reclaim_s) * fps
+        max_dist = (cfg.seated_reclaim_scale if seated_customer else 0.75) * h
+        if gap < 1 or gap > max_gap:
+            continue
+        # A seated customer only comes back at HIS OWN table. Without this rule, new arrivals who walk in
+        # near a customer that was briefly lost inherited that customer's history (and got hidden/mislabelled).
+        if seated_customer and table_id != old.assigned_table:
+            continue
+        # People who vanish at the doorway are leaving; whoever appears there next is usually a NEW person.
+        if not seated_customer and door_zone is not None and door_zone(old.last_center):
             continue
         dist = math.hypot(old.last_center[0] - cx, old.last_center[1] - cy)
-        if dist <= best_dist:
-            best_id, best_dist = tid, dist
+        if dist <= max_dist and dist < best_score:
+            best_id, best_score = tid, dist
     if best_id is not None:
-        new_ta.adopt(analytics.pop(best_id))
+        old = analytics[best_id]
+        new_ta.adopt(old)
+        # Keep a CUSTOMER's own record: the tracker often brings the old ID back a few frames later,
+        # and it must not restart as "Person".  Other (walking) tracks are moved as before.
+        if old.state != "CUSTOMER":
+            analytics.pop(best_id)
+        return best_id
+
+    # Duplicate box: the detector/tracker sometimes puts a SECOND ID on a person who is still
+    # tracked (the old ID is active, so the lookup above skips it).  A new ID whose box overlaps
+    # an active CUSTOMER almost completely is the same person -> inherit instead of starting as "Person".
+    for tid, old in analytics.items():
+        if old is new_ta or tid not in active_ids or old.state != "CUSTOMER":
+            continue
+        if frame_idx - old.last_seen_frame > 1:
+            continue
+        if _box_iou(box, old.last_box) >= 0.45:
+            new_ta.adopt(old)
+            return tid
+    return None
 
 
 
@@ -598,6 +838,142 @@ def draw_badge(img, text: str, x: int, y: int, color, text_color=(0, 0, 0), scal
 
 
 # Main DineSight Pipeline
+
+def build_quality_report(
+    *,
+    events: List[Dict],
+    entries: int,
+    exits: int,
+    unique_ids: int,
+    raw_ids: int,
+    merged_ids: int,
+    max_simultaneous: int,
+    initial_occupancy: int,
+    doorway_source: str,
+    doorway_confidence: Optional[float],
+    entry_source: str,
+    tables_source: str,
+    table_count: int,
+    analytics_from_profile: List[str],
+    analytics_from_cli: List[str],
+    overlapping_table_pairs: int = 0,
+    uniform_enabled: bool = False,
+    uniform_staff_count: int = 0,
+) -> Dict:
+    """
+    Self-assessment of a run: where the numbers come from and where to doubt them.
+    Pure function (no video / model needed), so it can be unit-tested on its own.
+    """
+    # Net door events per detection source (a cancelled reversal removes the event it cancels).
+    by_source: Dict[str, Dict[str, int]] = {}
+    cancelled = 0
+    for e in events:
+        etype, src = e.get("type", ""), e.get("source", "line")
+        bucket = by_source.setdefault(src, {"entries": 0, "exits": 0})
+        if etype == "ENTRY":
+            bucket["entries"] += 1
+        elif etype == "EXIT":
+            bucket["exits"] += 1
+        elif etype == "CANCEL_ENTRY":
+            bucket["entries"] -= 1
+            cancelled += 1
+        elif etype == "CANCEL_EXIT":
+            bucket["exits"] -= 1
+            cancelled += 1
+    by_source.setdefault("line", {"entries": 0, "exits": 0})
+    total_events = entries + exits
+    guessed = sum(b["entries"] + b["exits"] for src, b in by_source.items() if src != "line")
+    guessed_share = (guessed / total_events) if total_events > 0 else 0.0
+
+    expected_people = initial_occupancy + entries
+    ids_per_peak = round(unique_ids / max_simultaneous, 2) if max_simultaneous > 0 else None
+    ids_vs_expected = round(unique_ids / expected_people, 2) if expected_people > 0 else None
+
+    warnings: List[Dict[str, str]] = []
+
+    def warn(level: str, code: str, message: str) -> None:
+        warnings.append({"level": level, "code": code, "message": message})
+
+    if doorway_source == "fallback":
+        warn("critical", "door_fallback",
+             "No doorway could be found, so a default centred line was used. Entry/exit counts are "
+             "not reliable until the doorway line and entry direction are set (profile or --line/--entry-dir).")
+    elif doorway_source == "auto":
+        conf = f" (flow confidence {doorway_confidence:.2f})" if doorway_confidence is not None else ""
+        warn("warning", "door_auto",
+             f"The doorway line and entry direction were estimated automatically{conf}. Check them on the "
+             "output video and save a profile for this camera.")
+    if table_count == 0:
+        warn("critical", "no_tables", "No tables were found, so table status (empty/occupied) is not available.")
+    elif tables_source == "auto":
+        warn("warning", "tables_auto",
+             "Tables were discovered automatically from chair/table detections: some tables may be missing "
+             "and capacity is guessed. Empty/occupied status is only as good as these zones; define the "
+             "tables in a profile for reliable results.")
+    if overlapping_table_pairs > 0:
+        warn("warning", "tables_overlap",
+             f"{overlapping_table_pairs} pair(s) of table zones overlap by more than 15% of the smaller zone, so a person can be assigned to "
+             "the neighbouring table (wrong counts / false EMPTY). Redraw the tables so zones do not overlap.")
+    if total_events >= 2 and guessed_share >= 0.25:
+        warn("warning", "guessed_events",
+             f"{guessed} of {total_events} door events ({guessed_share:.0%}) were inferred (person first seen "
+             "inside the door zone, or lost at the door) rather than seen crossing the line. "
+             "Expect some over- or under-counting.")
+    if total_events == 0 and unique_ids >= 5:
+        warn("warning", "no_door_events",
+             f"{unique_ids} people were tracked but nothing was counted at the door. The line may be "
+             "misplaced, or nobody used this door in the clip.")
+    # Staff and people who never use this door legitimately add some IDs, so only flag a clear excess.
+    if ids_vs_expected is not None and ids_vs_expected >= 2.0 and unique_ids - expected_people >= 5:
+        warn("warning", "id_fragmentation",
+             f"{unique_ids} track IDs for about {expected_people} people expected (people inside at the start "
+             f"+ entries). The tracker probably split people into several IDs, so ID-based numbers "
+             "(customers/staff/unique IDs) are inflated.")
+    if uniform_enabled:
+        if uniform_staff_count == 0 and unique_ids >= 5:
+            warn("warning", "uniform_no_match",
+                 "A staff uniform colour is configured but nobody matched it. Re-sample the colour on a clear "
+                 "frame (lighting differs between cameras), or check that staff are visible.")
+        else:
+            warn("info", "staff_uniform",
+                 f"Staff identified mainly by uniform colour ({uniform_staff_count} matched); behaviour is a fallback. "
+                 "Customers wearing a similar colour (especially black/grey) can be mislabelled as staff.")
+    else:
+        warn("info", "staff_behaviour_only",
+             "Staff vs customer is inferred from behaviour (walking vs sitting) only; it can be wrong in venues "
+             "where staff also sit or customers keep moving. Sampling the uniform colour in the profile is stronger.")
+
+    n_critical = sum(1 for w in warnings if w["level"] == "critical")
+    n_warning = sum(1 for w in warnings if w["level"] == "warning")
+    confidence = "low" if (n_critical or n_warning >= 3) else ("medium" if n_warning else "high")
+
+    return {
+        "confidence": confidence,
+        "ids": {
+            "tracker_ids_raw": raw_ids,
+            "ids_merged_into_earlier_id": merged_ids,
+            "unique_track_ids": unique_ids,
+            "max_simultaneous_people": max_simultaneous,
+            "ids_per_peak_person": ids_per_peak,
+            "ids_vs_expected_people": ids_vs_expected,
+        },
+        "door_events": {
+            "by_source": by_source,
+            "cancelled_reversals": cancelled,
+            "guessed": guessed,
+            "guessed_share": round(guessed_share, 3),
+        },
+        "sources": {
+            "doorway": doorway_source,
+            "doorway_confidence": doorway_confidence,
+            "entry": entry_source,
+            "tables": tables_source,
+            "analytics_from_profile": analytics_from_profile,
+            "analytics_from_cli": analytics_from_cli,
+        },
+        "warnings": warnings,
+    }
+
 
 def _normalize_source(source: Source) -> Tuple[Union[str, int], bool]:
     """Return (value for cv2.VideoCapture, is_live)."""
@@ -625,8 +1001,8 @@ def run_dinesight_pipeline(
     write_video: bool = True,
     report_path: Optional[Path] = None,
     cfg: Optional[AnalyticsConfig] = None,
+    cfg_overrides: Optional[Dict[str, float]] = None,
 ):
-    cfg = cfg or AnalyticsConfig()
     cap_source, is_live = _normalize_source(video_path)
     if not is_live and not Path(cap_source).exists():
         raise FileNotFoundError(f"Video file not found: {Path(cap_source).resolve()}")
@@ -643,6 +1019,21 @@ def run_dinesight_pipeline(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     scale = max(width, height)
     name_for_profile = Path("live") if is_live else Path(cap_source)
+
+    # Classification settings: defaults < profile "analytics" block < command line.
+    # (An explicit `cfg` object, e.g. from code calling this function, is used as is.)
+    cfg_from_profile: Dict[str, float] = {}
+    cfg_from_cli: Dict[str, float] = {}
+    if cfg is None:
+        cfg = AnalyticsConfig()
+        cfg_from_profile = load_profile_analytics(profile_name, name_for_profile)
+        cfg_from_cli = {k: float(v) for k, v in (cfg_overrides or {}).items() if v is not None}
+        for key, value in {**cfg_from_profile, **cfg_from_cli}.items():
+            setattr(cfg, key, value)
+    uniform_cfg = load_profile_uniform(profile_name, name_for_profile)
+    if uniform_cfg is not None:
+        print(f"[Config] Staff uniform colour: {len(uniform_cfg.samples)} sample(s)"
+              f"{' (strict)' if uniform_cfg.strict else ''}")
 
     print("=" * 70)
     print("DineSight: Unified Vision & Counting Analytics")
@@ -730,6 +1121,11 @@ def run_dinesight_pipeline(
         reid_window_frames=max(8, int(2 * fps)),
         reid_distance_px=max(30.0, 0.06 * scale),
         table_hold_frames=max(3, int(0.8 * fps)),
+        # People entering through glass doors are often detected only after they passed the line.
+        spawn_zone_px=(0.12 * scale) if SPAWN_ENTRY else 0.0,
+        spawn_min_travel_px=max(20.0, 0.03 * scale),
+        spawn_window_frames=max(24, int(3 * fps)),
+        start_grace_frames=int(1.0 * fps),
     )
 
     writer = None
@@ -748,13 +1144,22 @@ def run_dinesight_pipeline(
 
     # Run-level bookkeeping for the JSON report / dashboard.
     seen_track_ids: set = set()
+    raw_track_ids: set = set()      # IDs exactly as the tracker issued them (before merging)
+    max_simultaneous = 0            # most distinct people visible in one frame
+    alias: Dict[int, int] = {}  # tracker ID -> first ID of the same person (ID switches)
+    canon = lambda t: alias.get(t, t)
     customer_track_ids: set = set()
     staff_track_ids: set = set()
+    uniform_staff_ids: set = set()   # staff confirmed by uniform colour (never demoted to customer)
     active_track_ids: set = set()
     table_peak: Dict[int, int] = {t["id"]: 0 for t in tables}
     table_visitors: Dict[int, set] = {t["id"]: set() for t in tables}
     occupancy_history: List[Dict] = []
-    next_sample_frame = 0
+    warmup_frames = max(1, int(cfg.warmup_s * fps))
+    next_sample_frame = warmup_frames  # no occupancy samples while the system is still calibrating
+    initial_occupancy: Optional[int] = None   # people already inside when the video started
+    entry_side = counter.doorway.entry_side
+    in_door_zone = lambda p: distance_to_segment(p, doorway_line[0], doorway_line[1]) <= 0.12 * scale
 
     try:
         while True:
@@ -779,15 +1184,20 @@ def run_dinesight_pipeline(
                 ids = result.boxes.id.int().cpu().tolist()
 
             active_track_ids = set(ids)
+            raw_track_ids.update(ids)
             table_occupants: Dict[int, List[int]] = {t["id"]: [] for t in tables}
             customers_estimated = staff_estimated = unknown_people = 0
+            frame_cids: Dict[int, Tuple[float, float, float, float]] = {}
+            warming = frame_idx < warmup_frames
 
             # Periodic cleanup of stale tracks
             if frame_idx % 60 == 0:
                 counter.cleanup_stale_tracks(frame_idx)
                 stale_ids = [
                     tid for tid, ta in track_analytics.items()
-                    if frame_idx - ta.last_seen_frame > max(120, int((cfg.reclaim_s + 2) * fps))
+                    if frame_idx - ta.last_seen_frame > max(
+                        120, int(((cfg.seated_reclaim_s if ta.state == "CUSTOMER" else cfg.reclaim_s) + 2) * fps)
+                    )
                     and tid not in active_track_ids
                 ]
                 for tid in stale_ids:
@@ -799,7 +1209,7 @@ def run_dinesight_pipeline(
                 foot = (cx, y2)
 
                 # 1. Doorway crossing (count.py)
-                event = counter.update_doorway(tid, foot, frame_idx)
+                event = counter.update_doorway(tid, foot, frame_idx, body_height=float(y2 - y1))
                 if event:
                     kind = event[0]
                     flashes.append((kind, (0, 255, 0) if kind == "ENTRY" else (0, 0, 255), foot, frame_idx + int(fps)))
@@ -810,36 +1220,74 @@ def run_dinesight_pipeline(
                 # 3. Behaviour analytics + classification
                 ta = track_analytics.get(tid)
                 if ta is None:
-                    ta = TrackAnalytics(tid, fps, cfg)
-                    reclaim_lost_analytics(track_analytics, ta, (x1, y1, x2, y2), frame_idx, active_track_ids, fps, cfg)
+                    ta = TrackAnalytics(tid, fps, cfg, uniform_cfg)
+                    adopted = reclaim_lost_analytics(
+                        track_analytics, ta, (x1, y1, x2, y2), frame_idx, active_track_ids, fps, cfg,
+                        table_id=candidate_table_id, door_zone=in_door_zone,
+                    )
+                    if adopted is not None:
+                        alias[tid] = canon(adopted)
                     track_analytics[tid] = ta
-                    seen_track_ids.add(tid)
+                    seen_track_ids.add(canon(tid))
+                if uniform_cfg is not None:
+                    ta.observe_uniform(frame, (x1, y1, x2, y2), frame_idx)
                 ta.update(frame_idx, (x1, y1, x2, y2), candidate_table_id)
 
+                # Stable display ID: after a tracker ID switch the person keeps the ID they had before.
+                cid = canon(tid)
+                prev_box = frame_cids.get(cid)
+                if prev_box is not None:
+                    if _box_iou((x1, y1, x2, y2), prev_box) >= 0.45:
+                        continue  # tracker put a second ID on the same person: draw/count him once
+                    cid = tid     # a different person that wrongly inherited this ID: keep the own ID
+                frame_cids[cid] = (x1, y1, x2, y2)
+                seen_track_ids.add(cid)  # every ID that is shown/counted must also be in the "seen" set
+
                 if ta.state == "CUSTOMER":
-                    customer_track_ids.add(tid)
+                    customer_track_ids.add(cid)
                 elif ta.state == "STAFF":
-                    staff_track_ids.add(tid)
+                    staff_track_ids.add(cid)
+                    if ta.uniform_status() == "match":
+                        uniform_staff_ids.add(cid)
 
                 if ta.state == "CUSTOMER":
                     customers_estimated += 1
                     if ta.assigned_table is not None:
-                        table_occupants[ta.assigned_table].append(tid)
-                        role_label = f"Customer #{tid} (T{ta.assigned_table})"
+                        table_occupants[ta.assigned_table].append(cid)
+                        role_label = f"Customer #{cid} (T{ta.assigned_table})"
                     else:
-                        role_label = f"Customer #{tid}"
+                        role_label = f"Customer #{cid}"
                     box_color = (255, 180, 0)
                 elif ta.state == "STAFF":
                     staff_estimated += 1
-                    role_label = f"Staff #{tid}"
+                    role_label = f"Staff #{cid}"
                     box_color = (0, 215, 255)
                 else:
                     unknown_people += 1
-                    role_label = f"Person #{tid}"
+                    role_label = f"Person #{cid}"
+                    if ta.is_settled():  # sitting at a table already: counts for occupancy, label stays neutral
+                        table_occupants[ta.assigned_table].append(cid)
+                        role_label = f"Seated #{cid} (T{ta.assigned_table})"
                     box_color = (180, 180, 180)
 
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
                 draw_badge(annotated, role_label, x1, y1, box_color)
+
+            max_simultaneous = max(max_simultaneous, len(frame_cids))
+
+            # 3b. IDs that vanished walking out through the door
+            for kind, _total, pos in counter.check_doorway_lost(frame_idx):
+                flashes.append((kind, (0, 0, 255), (int(pos[0]), int(pos[1])), frame_idx + int(fps)))
+
+            # 3c. People already inside at the start: the doorway only sees people who cross it, so
+            #     "inside now" = people inside when calibration ended - net change up to then + net change since.
+            if initial_occupancy is None and frame_idx >= warmup_frames - 1:
+                inside_now = 0
+                for box, tid in zip(boxes, ids):
+                    foot_pt = (int((box[0] + box[2]) / 2), int(box[3]))
+                    if signed_side(foot_pt, doorway_line[0], doorway_line[1]) == entry_side:
+                        inside_now += 1
+                initial_occupancy = max(0, inside_now - counter.get_summary()["net_change"])
 
             # 4. Table statuses
             table_summary = counter.evaluate_tables(table_occupants, frame_idx)
@@ -850,7 +1298,7 @@ def run_dinesight_pipeline(
             for t_id, t_info in table_summary["table_statuses"].items():
                 table_peak[t_id] = max(table_peak.get(t_id, 0), t_info["count"])
                 if t_info["seated_ids"]:
-                    table_visitors.setdefault(t_id, set()).update(t_info["seated_ids"])
+                    table_visitors.setdefault(t_id, set()).update(canon(i) for i in t_info["seated_ids"])
 
             if frame_idx >= next_sample_frame:
                 occupancy_history.append({
@@ -870,7 +1318,9 @@ def run_dinesight_pipeline(
                 bx1, by1, bx2, by2 = t["box"]
                 t_info = table_summary["table_statuses"][t["id"]]
                 count_val, cap_val, status_str = t_info["count"], t_info["capacity"], t_info["status"]
-                if status_str == "EMPTY":
+                if warming:
+                    t_color, badge = (160, 160, 160), f"{t['name']}: CALIBRATING"
+                elif status_str == "EMPTY":
                     t_color, badge = (0, 255, 0), f"{t['name']}: EMPTY (0/{cap_val})"
                 elif status_str == "FULL":
                     t_color, badge = (0, 0, 255), f"{t['name']}: FULL ({count_val}/{cap_val})"
@@ -906,19 +1356,38 @@ def run_dinesight_pipeline(
             doorway_stats = counter.get_summary()
             entries, exits, net_change = doorway_stats["entries"], doorway_stats["exits"], doorway_stats["net_change"]
 
-            hud_w, hud_h = max(360, int(width * 0.42)), 175
+            ui = min(2.0, max(0.8, width / 960.0))  # HUD scales with the video resolution
+            fs, line_h = 0.52 * ui, int(26 * ui)
+            if warming:
+                inside_txt = "Inside Now    : calibrating..."
+                empty_list_str = "Empty Tables  : calibrating..."
+                tables_txt = f"Tables Total  : {len(tables)} (calibrating...)"
+            else:
+                inside_now_est = max(0, (initial_occupancy or 0) + net_change)
+                inside_txt = f"Inside Now    : {inside_now_est} est. (started with {initial_occupancy or 0})"
+                tables_txt = f"Tables Total  : {len(tables)} (Active: {len(occupied_tables) + len(full_tables)}, Empty: {len(empty_tables)})"
+                empty_list_str = f"Empty Tables  : {', '.join(empty_tables[:3])}" if empty_tables else "Empty Tables  : None"
+            hud_lines = [
+                (f"Doorway Flow  : Entries={entries} | Exits={exits} (Net Change: {net_change:+d})", (0, 255, 255)),
+                (inside_txt, (255, 255, 255)),
+                (f"Detected Now  : {len(boxes)} boxes ({len(active_track_ids)} active tracks)", (255, 255, 255)),
+                (f"Classification: Customers={customers_estimated} | Staff={staff_estimated} | Unknown={unknown_people}", (255, 215, 0)),
+                (tables_txt, (0, 165, 255)),
+                (empty_list_str, (0, 255, 0)),
+            ]
+            title = "DINESIGHT VISION ANALYTICS"
+            text_w = max(cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)[0][0] for t, _ in hud_lines)
+            hud_w = min(width - 24, max(int(text_w + 24), int(300 * ui)))
+            hud_h = int(line_h * (len(hud_lines) + 1) + 18 * ui)
             overlay = annotated.copy()
             cv2.rectangle(overlay, (12, 12), (12 + hud_w, 12 + hud_h), (18, 18, 18), -1)
             cv2.addWeighted(overlay, 0.85, annotated, 0.15, 0, annotated)
             cv2.rectangle(annotated, (12, 12), (12 + hud_w, 12 + hud_h), (100, 100, 100), 1)
-
-            cv2.putText(annotated, "DINESIGHT VISION ANALYTICS", (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(annotated, f"Doorway Flow  : Entries={entries} | Exits={exits} (Net Change: {net_change:+d})", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(annotated, f"Detected Now  : {len(boxes)} boxes ({len(active_track_ids)} active tracks)", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(annotated, f"Classification: Customers={customers_estimated} | Staff={staff_estimated} | Unknown={unknown_people}", (20, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 215, 0), 1, cv2.LINE_AA)
-            cv2.putText(annotated, f"Tables Total  : {len(tables)} (Active: {len(occupied_tables) + len(full_tables)}, Empty: {len(empty_tables)})", (20, 126), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 165, 255), 1, cv2.LINE_AA)
-            empty_list_str = f"Empty Tables  : {', '.join(empty_tables[:3])}" if empty_tables else "Empty Tables  : None"
-            cv2.putText(annotated, empty_list_str, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1, cv2.LINE_AA)
+            y = 12 + line_h
+            cv2.putText(annotated, title, (20, y), cv2.FONT_HERSHEY_SIMPLEX, fs * 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+            for text, color in hud_lines:
+                y += line_h
+                cv2.putText(annotated, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, fs, color, 1, cv2.LINE_AA)
 
             if writer is not None:
                 writer.write(annotated)
@@ -938,6 +1407,11 @@ def run_dinesight_pipeline(
         if writer is not None:
             writer.release()
 
+    # A person who was first judged STAFF and later sat down long enough is a CUSTOMER: never count them twice,
+    # so that customers + staff + unknown always add up to the unique IDs.
+    customer_track_ids -= uniform_staff_ids
+    staff_track_ids |= uniform_staff_ids
+    staff_track_ids -= customer_track_ids
     final_stats = counter.get_summary()
     empty_tables = table_summary["empty_tables"]
     occupied_total = len(table_summary["occupied_tables"]) + len(table_summary["full_tables"])
@@ -947,12 +1421,41 @@ def run_dinesight_pipeline(
     print(f"Doorway Entries        : {final_stats['entries']}")
     print(f"Doorway Exits          : {final_stats['exits']}")
     print(f"Net Change             : {final_stats['net_change']:+d}")
+    print(f"Inside at start / end  : {initial_occupancy or 0} / {max(0, (initial_occupancy or 0) + final_stats['net_change'])} (estimates)")
     print(f"Total Tables Monitored : {len(tables)}")
     print(f"Empty Tables Count     : {len(empty_tables)} -> {empty_tables}")
     print(f"Occupied Tables Count  : {occupied_total}")
     print(f"Unique Track IDs       : {len(seen_track_ids)}")
     print(f"Customers / Staff      : {len(customer_track_ids)} / {len(staff_track_ids)}")
     print(f"Unknown / Visible Now  : {len(seen_track_ids - customer_track_ids - staff_track_ids)} / {len(active_track_ids)}")
+    quality = build_quality_report(
+        events=counter.get_events(),
+        entries=final_stats["entries"],
+        exits=final_stats["exits"],
+        unique_ids=len(seen_track_ids),
+        raw_ids=len(raw_track_ids),
+        merged_ids=len(alias),
+        max_simultaneous=max_simultaneous,
+        initial_occupancy=initial_occupancy or 0,
+        doorway_source=doorway_source,
+        doorway_confidence=doorway_confidence,
+        entry_source=entry_source,
+        tables_source=tables_source,
+        table_count=len(tables),
+        analytics_from_profile=sorted(cfg_from_profile),
+        analytics_from_cli=sorted(cfg_from_cli),
+        overlapping_table_pairs=sum(
+            1 for i in range(len(tables)) for j in range(i + 1, len(tables))
+            if _overlap_share(tables[i]["box"], tables[j]["box"]) > 0.15
+        ),
+        uniform_enabled=uniform_cfg is not None,
+        uniform_staff_count=len(uniform_staff_ids),
+    )
+    print(f"Result confidence      : {quality['confidence'].upper()} "
+          f"(peak {max_simultaneous} people on screen, {len(seen_track_ids)} unique IDs)")
+    for w in quality["warnings"]:
+        if w["level"] != "info":
+            print(f"  [{w['level'].upper()}] {w['message']}")
     if write_video:
         print(f"Output Video Saved     : {output_path.resolve()}")
     print("=" * 70)
@@ -978,6 +1481,8 @@ def run_dinesight_pipeline(
             "entries": final_stats["entries"],
             "exits": final_stats["exits"],
             "net_change": final_stats["net_change"],
+            "initial_occupancy_estimate": initial_occupancy or 0,
+            "inside_now_estimate": max(0, (initial_occupancy or 0) + final_stats["net_change"]),
             "doorway_line": [list(doorway_line[0]), list(doorway_line[1])],
             "doorway_line_normalized": line_normalized,
             "entry": list(entry_vector) if entry_vector else entry_direction,
@@ -1007,6 +1512,13 @@ def run_dinesight_pipeline(
                 "full_tables": full_tables,
             },
             "tables": table_report,
+            "quality": quality,
+            "staff_uniform": {
+                "enabled": uniform_cfg is not None,
+                "samples": [list(x) for x in uniform_cfg.samples] if uniform_cfg else [],
+                "matched_staff_ids": sorted(uniform_staff_ids),
+            },
+            "analytics_settings": {f.name: getattr(cfg, f.name) for f in dataclass_fields(AnalyticsConfig)},
             "occupancy_history": occupancy_history,
             "events": [dict(e, time_s=round(e["frame"] / fps, 2)) for e in counter.get_events()],
         }
@@ -1035,7 +1547,11 @@ def main():
     parser.add_argument("--no-video", action="store_true", help="Skip writing the annotated video (faster)")
     parser.add_argument("--report", default=None, help="Write a JSON report (counts, tables, event log) to this path")
     parser.add_argument("--customer-dwell", type=float, default=None, help="Seconds seated at a table to count as a customer")
+    parser.add_argument("--no-spawn-entry", action="store_true",
+                        help="Count doorway crossings only; disable the 'first seen inside the door zone' entry/exit logic")
     parser.add_argument("--staff-observe", type=float, default=None, help="Seconds on screen before a walker can be labelled staff")
+    parser.add_argument("--staff-min-walk", type=float, default=None, help="Seconds of walking required before a person can be labelled staff")
+    parser.add_argument("--warmup-seconds", type=float, default=None, help="Start-up calibration time before table status is shown")
     args = parser.parse_args()
 
     line_override = None
@@ -1045,11 +1561,18 @@ def main():
             parser.error("--line needs 4 comma-separated numbers: x1,y1,x2,y2")
         line_override = ((coords[0], coords[1]), (coords[2], coords[3]))
 
-    cfg = AnalyticsConfig()
+    global SPAWN_ENTRY
+    SPAWN_ENTRY = not args.no_spawn_entry
+
+    cfg_overrides = {}
     if args.customer_dwell is not None:
-        cfg.customer_dwell_s = args.customer_dwell
+        cfg_overrides["customer_dwell_s"] = args.customer_dwell
     if args.staff_observe is not None:
-        cfg.staff_observe_s = args.staff_observe
+        cfg_overrides["staff_observe_s"] = args.staff_observe
+    if args.staff_min_walk is not None:
+        cfg_overrides["staff_min_walk_s"] = args.staff_min_walk
+    if args.warmup_seconds is not None:
+        cfg_overrides["warmup_s"] = args.warmup_seconds
 
     run_dinesight_pipeline(
         video_path=args.video_path,
@@ -1064,7 +1587,7 @@ def main():
         scan_seconds=args.scan_seconds,
         write_video=not args.no_video,
         report_path=Path(args.report) if args.report else None,
-        cfg=cfg,
+        cfg_overrides=cfg_overrides,
     )
 
 

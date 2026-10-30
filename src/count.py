@@ -19,6 +19,7 @@ All counting logic lives here:
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 Point = Tuple[float, float]
@@ -32,9 +33,7 @@ _DIRECTION_VECTORS: Dict[str, Point] = {
 }
 
 
-# ----------------------------------------------------------------------
 # Geometric helpers
-# ----------------------------------------------------------------------
 def signed_distance(point: Point, start: Point, end: Point) -> float:
     """Signed perpendicular distance (pixels) from *point* to the infinite line start->end."""
     px, py = point
@@ -75,6 +74,18 @@ def line_crossing_point(p0: Point, p1: Point, start: Point, end: Point) -> Optio
     return (p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1]))
 
 
+def entry_unit_vector(direction: str = "left_to_right", vector: Optional[Point] = None) -> Point:
+    """Unit vector (dx, dy) of the direction of travel that counts as an ENTRY."""
+    if vector is None:
+        if direction not in _DIRECTION_VECTORS:
+            raise ValueError(f"Unknown entry direction '{direction}'.")
+        vector = _DIRECTION_VECTORS[direction]
+    norm = math.hypot(vector[0], vector[1])
+    if norm == 0:
+        raise ValueError("entry vector must be non-zero")
+    return (vector[0] / norm, vector[1] / norm)
+
+
 def resolve_entry_side(
     start: Point,
     end: Point,
@@ -110,9 +121,7 @@ def resolve_entry_side(
     return 1 if d > 0 else -1
 
 
-# ----------------------------------------------------------------------
 # Per-track crossing state
-# ----------------------------------------------------------------------
 class _TrackCrossingState:
     """Internal bookkeeping for one tracked person relative to the line."""
 
@@ -123,24 +132,39 @@ class _TrackCrossingState:
         "last_seen_frame",      # frame index of last observation
         "last_crossing_frame",  # frame when the last crossing was counted
         "last_event",           # "ENTRY" / "EXIT" / None  (last counted crossing)
+        "last_source",          # how that crossing was detected: "line" / "appeared-in-door-zone" / "lost-at-door"
         "entry_count",
         "exit_count",
+        "first_point",          # first foot-point ever seen for this ID
+        "first_frame",
+        "inherited",            # state was inherited from a lost ID (re-identification)
+        "spawn_candidate",      # appeared inside the door zone: may count as ENTRY without a line crossing
+        "trail",                # recent (frame, foot_point) pairs
+        "last_height",          # last body height in pixels
+        "lost_checked",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, trail_len: int = 72) -> None:
+        self.first_point: Optional[Point] = None
+        self.first_frame: int = 0
+        self.inherited: bool = False
+        self.spawn_candidate: bool = False
+        self.trail: deque = deque(maxlen=max(8, trail_len))
+        self.last_height: float = 0.0
+        self.lost_checked: bool = False
         self.committed_side: Optional[int] = None
         self.anchor_point: Optional[Point] = None
         self.last_position: Optional[Point] = None
         self.last_seen_frame: int = 0
         self.last_crossing_frame: int = -10**9
         self.last_event: Optional[str] = None
+        self.last_source: str = "line"
         self.entry_count: int = 0
         self.exit_count: int = 0
 
 
-# ----------------------------------------------------------------------
+
 # LineCrossingCounter
-# ----------------------------------------------------------------------
 class LineCrossingCounter:
     """
     Counts people crossing a doorway line with directional flow.
@@ -179,6 +203,10 @@ class LineCrossingCounter:
         entry_vector: Optional[Point] = None,
         reid_window_frames: int = 0,
         reid_distance_px: float = 60.0,
+        spawn_zone_px: float = 0.0,
+        spawn_min_travel_px: float = 30.0,
+        spawn_window_frames: int = 72,
+        start_grace_frames: int = 0,
         verbose: bool = True,
     ) -> None:
         self.line_start = line_start
@@ -192,8 +220,18 @@ class LineCrossingCounter:
         self.reid_window_frames = reid_window_frames
         self.reid_distance_px = reid_distance_px
         self.verbose = verbose
+        # "Appeared inside the door zone" logic (0 disables it). People who walk in through glass
+        # doors are often first detected AFTER they already passed the line, so no crossing is
+        # ever seen.  A new ID that first shows up within spawn_zone_px of the doorway on the
+        # inside and then keeps walking inward counts as an ENTRY; an ID that walks outward
+        # and vanishes inside the zone counts as an EXIT.
+        self.spawn_zone_px = float(spawn_zone_px)
+        self.spawn_min_travel_px = float(spawn_min_travel_px)
+        self.spawn_window_frames = int(spawn_window_frames)
+        self.start_grace_frames = int(start_grace_frames)
 
         self._entry_side = resolve_entry_side(line_start, line_end, entry_direction, entry_vector)
+        self._entry_unit = entry_unit_vector(entry_direction, entry_vector)
 
         self.entries: int = 0
         self.exits: int = 0
@@ -207,19 +245,34 @@ class LineCrossingCounter:
         track_id: int,
         foot_point: Point,
         frame_idx: int = 0,
+        body_height: float = 0.0,
     ) -> Optional[Tuple[str, int]]:
         """
         Feed a new observation for *track_id*.
 
         Returns ``("ENTRY", total_entries)`` or ``("EXIT", total_exits)`` when a
-        confirmed crossing occurs, otherwise ``None``.
+        confirmed crossing occurs, otherwise ``None``.  *body_height* (pixels) is optional
+        and only used to scale the inward-travel requirement of the door-zone logic.
         """
         state = self._tracks.get(track_id)
         if state is None:
             state = self._spawn_state(foot_point, frame_idx)
             self._tracks[track_id] = state
+            state.first_point = foot_point
+            state.first_frame = frame_idx
+            state.spawn_candidate = bool(
+                self.spawn_zone_px > 0
+                and not state.inherited
+                and frame_idx >= self.start_grace_frames
+                and signed_side(foot_point, self.line_start, self.line_end) == self._entry_side
+                and distance_to_segment(foot_point, self.line_start, self.line_end) <= self.spawn_zone_px
+            )
 
         state.last_seen_frame = frame_idx
+        state.lost_checked = False
+        if body_height > 0:
+            state.last_height = float(body_height)
+        state.trail.append((frame_idx, foot_point))
         d = signed_distance(foot_point, self.line_start, self.line_end)
 
         # First sighting right on the line (typical for a door at the frame border):
@@ -236,8 +289,45 @@ class LineCrossingCounter:
             state.committed_side = side
             state.anchor_point = foot_point
 
+        if event is None:
+            event = self._check_spawn_entry(state, track_id, foot_point, frame_idx, body_height)
+
         state.last_position = foot_point
         return event
+
+    def check_lost(self, current_frame: int) -> List[Tuple[str, int, Point]]:
+        """
+        Call once per frame.  Finds IDs that vanished next to the doorway while walking OUTWARD
+        (typically leaving through a glass door the detector loses) and counts them as EXIT.
+        Returns ``[(\"EXIT\", total_exits, last_position), ...]``.
+        """
+        out: List[Tuple[str, int, Point]] = []
+        if self.spawn_zone_px <= 0:
+            return out
+        gap_needed = max(10, self.reid_window_frames + 1)  # past the re-identification window
+        ux, uy = self._entry_unit
+        for tid, st in list(self._tracks.items()):
+            if st.lost_checked or st.last_position is None:
+                continue
+            if current_frame - st.last_seen_frame < gap_needed:
+                continue
+            st.lost_checked = True
+            if st.last_event is not None or st.entry_count or st.exit_count:
+                continue  # its crossing was already counted
+            if st.committed_side is not None and st.committed_side != self._entry_side:
+                continue  # it was on the outside the whole time
+            if distance_to_segment(st.last_position, self.line_start, self.line_end) > self.spawn_zone_px:
+                continue
+            if len(st.trail) < 2:
+                continue
+            _, p0 = st.trail[0]
+            outward = -((st.last_position[0] - p0[0]) * ux + (st.last_position[1] - p0[1]) * uy)
+            if outward < max(self.spawn_min_travel_px, 0.5 * st.last_height):
+                continue
+            res = self._register(st, tid, "EXIT", current_frame, source="lost-at-door")
+            if res:
+                out.append((res[0], res[1], st.last_position))
+        return out
 
     def cleanup_stale(self, current_frame: int) -> List[int]:
         """Remove tracks not seen for ``stale_after_frames``. Returns purged IDs."""
@@ -250,6 +340,11 @@ class LineCrossingCounter:
         return stale_ids
 
     @property
+    def entry_side(self) -> int:
+        """Side (+1 / -1) of the line on which people stand once they are INSIDE."""
+        return self._entry_side
+
+    @property
     def net_change(self) -> int:
         """Entries minus exits since counting began."""
         return self.entries - self.exits
@@ -260,7 +355,7 @@ class LineCrossingCounter:
     # Internal helpers
     def _spawn_state(self, foot_point: Point, frame_idx: int) -> _TrackCrossingState:
         """Create state for a new ID, inheriting from a recently lost ID when one matches."""
-        state = _TrackCrossingState()
+        state = _TrackCrossingState(self.spawn_window_frames)
         if self.reid_window_frames <= 0:
             return state
 
@@ -277,11 +372,14 @@ class LineCrossingCounter:
 
         if best_tid is not None:
             old = self._tracks.pop(best_tid)
+            state.inherited = True
+            state.last_height = old.last_height
             state.committed_side = old.committed_side
             state.anchor_point = old.anchor_point
             state.last_position = old.last_position
             state.last_crossing_frame = old.last_crossing_frame
             state.last_event = old.last_event
+            state.last_source = old.last_source
             state.entry_count = old.entry_count
             state.exit_count = old.exit_count
         return state
@@ -314,8 +412,43 @@ class LineCrossingCounter:
                 self._cancel_last(state, track_id, frame_idx)
             return None
 
+        return self._register(state, track_id, kind, frame_idx)
+
+    def _check_spawn_entry(
+        self,
+        state: _TrackCrossingState,
+        track_id: int,
+        point: Point,
+        frame_idx: int,
+        body_height: float,
+    ) -> Optional[Tuple[str, int]]:
+        """ENTRY for an ID that first appeared inside the door zone and then walks further inside."""
+        if not state.spawn_candidate:
+            return None
+        if state.last_event is not None or state.entry_count or state.exit_count:
+            state.spawn_candidate = False
+            return None
+        if frame_idx - state.first_frame > self.spawn_window_frames or state.first_point is None:
+            state.spawn_candidate = False
+            return None
+        ux, uy = self._entry_unit
+        travel = (point[0] - state.first_point[0]) * ux + (point[1] - state.first_point[1]) * uy
+        if travel < max(self.spawn_min_travel_px, 0.5 * body_height):
+            return None
+        state.spawn_candidate = False
+        return self._register(state, track_id, "ENTRY", frame_idx, source="appeared-in-door-zone")
+
+    def _register(
+        self,
+        state: _TrackCrossingState,
+        track_id: int,
+        kind: str,
+        frame_idx: int,
+        source: str = "line",
+    ) -> Optional[Tuple[str, int]]:
         state.last_crossing_frame = frame_idx
         state.last_event = kind
+        state.last_source = source
         if kind == "ENTRY":
             self.entries += 1
             state.entry_count += 1
@@ -325,9 +458,9 @@ class LineCrossingCounter:
             state.exit_count += 1
             total = self.exits
 
-        self.events.append({"frame": frame_idx, "track_id": track_id, "type": kind})
+        self.events.append({"frame": frame_idx, "track_id": track_id, "type": kind, "source": source})
         if self.verbose:
-            print(f"[Frame {frame_idx:4d}] {kind} COUNTED: ID={track_id}, total={total}")
+            print(f"[Frame {frame_idx:4d}] {kind} COUNTED: ID={track_id}, total={total} ({source})")
         return (kind, total)
 
     def _cancel_last(self, state: _TrackCrossingState, track_id: int, frame_idx: int) -> None:
@@ -337,7 +470,8 @@ class LineCrossingCounter:
         elif state.last_event == "EXIT":
             self.exits = max(0, self.exits - 1)
             state.exit_count = max(0, state.exit_count - 1)
-        self.events.append({"frame": frame_idx, "track_id": track_id, "type": f"CANCEL_{state.last_event}"})
+        self.events.append({"frame": frame_idx, "track_id": track_id, "type": f"CANCEL_{state.last_event}",
+                            "source": state.last_source})
         if self.verbose:
             print(f"[Frame {frame_idx:4d}] reversal: cancelled {state.last_event} for ID={track_id}")
         state.last_event = None
@@ -437,6 +571,10 @@ class DineSightCounter:
         reid_window_frames: int = 0,
         reid_distance_px: float = 60.0,
         table_hold_frames: int = 0,
+        spawn_zone_px: float = 0.0,
+        spawn_min_travel_px: float = 30.0,
+        spawn_window_frames: int = 72,
+        start_grace_frames: int = 0,
         verbose: bool = True,
     ) -> None:
         self.doorway = LineCrossingCounter(
@@ -450,6 +588,10 @@ class DineSightCounter:
             entry_vector=entry_vector,
             reid_window_frames=reid_window_frames,
             reid_distance_px=reid_distance_px,
+            spawn_zone_px=spawn_zone_px,
+            spawn_min_travel_px=spawn_min_travel_px,
+            spawn_window_frames=spawn_window_frames,
+            start_grace_frames=start_grace_frames,
             verbose=verbose,
         )
         self.table_tracker = TableOccupancyTracker(tables or [], hold_frames=table_hold_frames)
@@ -460,8 +602,12 @@ class DineSightCounter:
         track_id: int,
         foot_point: Point,
         frame_idx: int = 0,
+        body_height: float = 0.0,
     ) -> Optional[Tuple[str, int]]:
-        return self.doorway.update_track(track_id, foot_point, frame_idx)
+        return self.doorway.update_track(track_id, foot_point, frame_idx, body_height)
+
+    def check_doorway_lost(self, frame_idx: int) -> List[Tuple[str, int, Point]]:
+        return self.doorway.check_lost(frame_idx)
 
     def cleanup_stale_tracks(self, current_frame: int) -> List[int]:
         return self.doorway.cleanup_stale(current_frame)

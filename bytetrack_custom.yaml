@@ -2,6 +2,6 @@ tracker_type: bytetrack
 track_high_thresh: 0.30 # boxes above this start/continue tracks
 track_low_thresh: 0.10 # weak boxes can still keep an existing track alive (occlusions)
 new_track_thresh: 0.35 # a NEW ID needs a confident detection -> fewer ghost people
-track_buffer: 60 # frames a lost track is remembered (recovers the SAME id after occlusion)
+track_buffer: 150 # frames a lost track is remembered (was 60). Ultralytics scales it by fps/30, so 150 = ~5 s at 30 fps, ~4 s at 24 fps
 match_thresh: 0.85
 fuse_score: True
