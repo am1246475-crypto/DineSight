@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 DB_CONFIG = {
     "dbname": "dinesight",
     "user": "postgres",
-    "password": "farah",
+    "password": "",
     "host": "localhost",
     "port": 5432,
 }
