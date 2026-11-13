@@ -1,0 +1,10 @@
+{"camera_id": "entrance", "track_id": 5, "event_type": "enter", "timestamp": "2026-11-13T19:09:09.134Z", "meta": {"frame": 20, "anchor": [207.8, 431.1]}}
+{"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-13T19:10:04.378Z", "meta": {"frame": 173, "anchor": [29.7, 356.1]}}
+{"camera_id": "entrance", "track_id": 4, "event_type": "enter", "timestamp": "2026-11-13T19:10:26.056Z", "meta": {"frame": 233, "anchor": [217.8, 312.6]}}
+{"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-13T19:11:12.977Z", "meta": {"frame": 363, "anchor": [177.3, 431.2]}}
+{"camera_id": "entrance", "track_id": 1, "event_type": "enter", "timestamp": "2026-11-13T19:19:23.047Z", "meta": {"frame": 73, "anchor": [395.0, 689.0]}}
+{"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-13T19:19:23.773Z", "meta": {"frame": 75, "anchor": [298.8, 671.1]}}
+{"camera_id": "entrance", "track_id": 11, "event_type": "enter", "timestamp": "2026-11-13T19:19:44.421Z", "meta": {"frame": 132, "anchor": [328.2, 634.2]}}
+{"camera_id": "entrance", "track_id": 6, "event_type": "exit", "timestamp": "2026-11-13T19:19:49.503Z", "meta": {"frame": 146, "anchor": [312.0, 563.2]}}
+{"camera_id": "entrance", "track_id": 0, "event_type": "exit", "timestamp": "2026-11-13T19:19:55.668Z", "meta": {"frame": 163, "anchor": [310.9, 669.8]}}
+{"camera_id": "entrance", "track_id": 2, "event_type": "exit", "timestamp": "2026-11-13T19:20:01.864Z", "meta": {"frame": 180, "anchor": [311.9, 555.8]}}

@@ -34,3 +34,13 @@ runs/streamlit/
 *.swp
 *.swo
 
+# Video files
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.mpeg
+*.mpg
+*.m4v
+
