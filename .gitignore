@@ -1,8 +1,9 @@
-# Virtual Environment (37,000+ files)
+
+# Virtual Environment
 .venv/
 venv/
 ENV/
-env/
+.env
 
 # Python cache & build
 __pycache__/
@@ -43,4 +44,3 @@ runs/streamlit/
 *.mpeg
 *.mpg
 *.m4v
-

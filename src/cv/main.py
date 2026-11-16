@@ -1,11 +1,15 @@
 """
 cv/main.py  --  CV pipeline for ONE camera:
-    source (file / RTSP / webcam) -> detect() -> Tracker.update() -> LineCounter -> events -> API
+    source (file / RTSP / webcam) -> detect() -> Tracker.update() -> ZoneCounter -> events -> API
 
 Run it from inside the cv/ folder (it imports detection.py, tracking.py, counting.py):
 
     # test on a video file, no backend yet (events are printed and saved to events.jsonl)
     python main.py --source test.mp4 --show --realtime
+
+    # set your own zones (normalized 0..1, quote the value because of the ';')
+    python main.py --source test.mp4 --show \
+        --outside "0,0;0.3,0;0.3,1;0,1" --door "0.3,0;0.7,0;0.7,1;0.3,1" --inside "0.7,0;1,0;1,1;0.7,1"
 
     # RTSP camera (or the local MediaMTX test stream), send events to the backend
     python main.py --source rtsp://localhost:8554/entrance --camera-id entrance \
@@ -25,10 +29,23 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
-from counting import DEFAULT_LINE, LineCounter, parse_line
+from counting import DEFAULT_DOOR, DEFAULT_INSIDE, DEFAULT_OUTSIDE, ZoneCounter, parse_polygon
 from detection import detect, load_model
 from tracking import Tracker
+
+
+# ====================================================================== resize
+def resize_frame(frame, target_width: int):
+    """Shrink a frame to `target_width` (keeping the aspect ratio). Never enlarges.
+    Detection, tracking, counting and drawing all use this SAME resized frame, so the
+    line, the boxes and the pixel margins always live in one coordinate system."""
+    h, w = frame.shape[:2]
+    if target_width <= 0 or w <= target_width:
+        return frame
+    scale = target_width / float(w)
+    return cv2.resize(frame, (target_width, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
 
 
 # ====================================================================== frame source
@@ -230,26 +247,34 @@ def _color(track_id: int) -> Tuple[int, int, int]:
     return (int((track_id * 37) % 255), int((track_id * 17 + 80) % 255), int((track_id * 97 + 40) % 255))
 
 
-def draw_overlay(frame, tracks: List[Dict[str, Any]], counter: LineCounter, fps: float) -> None:
-    h, w = frame.shape[:2]
-    (ax, ay), (bx, by) = counter.line
-    a = (int(ax * w), int(ay * h))
-    b = (int(bx * w), int(by * h))
-    cv2.line(frame, a, b, (0, 255, 255), 2)
+ZONE_COLORS = {"outside": (70, 70, 255), "door": (0, 215, 255), "inside": (70, 220, 70)}   # BGR
 
-    # arrow showing the INSIDE side (flip with --invert if it points the wrong way)
-    mx, my = (a[0] + b[0]) // 2, (a[1] + b[1]) // 2
-    nx, ny = counter.inside_normal(w, h)
-    tip = (int(mx + nx * 60), int(my + ny * 60))
-    cv2.arrowedLine(frame, (mx, my), tip, (0, 255, 0), 2, tipLength=0.3)
-    cv2.putText(frame, "IN", (tip[0] + 5, tip[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+def draw_overlay(frame, tracks: List[Dict[str, Any]], counter: ZoneCounter, fps: float) -> None:
+    h, w = frame.shape[:2]
+
+    # semi-transparent zones + outlines + names
+    layer = frame.copy()
+    polys = {}
+    for name, poly in counter.polygons.items():
+        pts = np.array([(int(x * w), int(y * h)) for x, y in poly], dtype=np.int32)
+        polys[name] = pts
+        cv2.fillPoly(layer, [pts], ZONE_COLORS[name])
+    cv2.addWeighted(layer, 0.25, frame, 0.75, 0, frame)
+    for name, pts in polys.items():
+        cv2.polylines(frame, [pts], True, ZONE_COLORS[name], 2)
+        x0, y0 = pts.min(axis=0)
+        cv2.putText(frame, name.upper(), (int(x0) + 6, int(y0) + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ZONE_COLORS[name], 2)
 
     for trk in tracks:
         x1, y1, x2, y2 = [int(round(v)) for v in trk["bbox"]]
         tid = int(trk["track_id"])
         col = _color(tid)
+        zone = counter._state.get(tid, {}).get("stable_zone") or "?"      # zone the counter currently believes
         cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
-        cv2.putText(frame, f"ID {tid}", (x1, max(14, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+        label = f"ID {tid} [{zone}]"
+        (tw, _th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.putText(frame, label, (max(0, min(x1, w - tw - 2)), max(44, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
         ax_pt, ay_pt = counter._anchor_point(trk["bbox"])
         cv2.circle(frame, (int(ax_pt), int(ay_pt)), 4, (0, 0, 255), -1)
 
@@ -263,10 +288,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Entry/exit counting pipeline for one camera")
     p.add_argument("--source", required=True, help="video file, rtsp://... URL, or webcam index (0)")
     p.add_argument("--camera-id", default="entrance", help="camera_id written in every event")
-    p.add_argument("--line", type=parse_line, default=DEFAULT_LINE, help="virtual line x1,y1,x2,y2 normalized (default 0.25,0,0.25,1)")
-    p.add_argument("--invert", action="store_true", help="swap which side of the line is 'inside'")
-    p.add_argument("--anchor", choices=["bottom", "center"], default="bottom", help="which point of the box is tested against the line")
-    p.add_argument("--margin", type=float, default=8.0, help="dead band around the line in pixels")
+    p.add_argument("--outside", type=parse_polygon, default=DEFAULT_OUTSIDE, help="outside zone: 'x1,y1;x2,y2;x3,y3;...' normalized 0..1")
+    p.add_argument("--door", type=parse_polygon, default=DEFAULT_DOOR, help="door zone (the area people must pass through)")
+    p.add_argument("--inside", type=parse_polygon, default=DEFAULT_INSIDE, help="inside zone")
+    p.add_argument("--anchor", choices=["bottom", "center"], default="bottom", help="which point of the box is tested against the zones")
+    p.add_argument("--stable-frames", type=int, default=3, help="frames a track must stay in a zone before the zone change is accepted")
+    p.add_argument("--door-timeout", type=int, default=90, help="frames after which an unfinished door crossing is cancelled")
+    p.add_argument("--width", type=int, default=768, help="resize every frame to this width before processing (0 = no resize, never enlarges)")
     p.add_argument("--weights", default="rtdetr-l.pt", help="detector weights")
     p.add_argument("--conf", type=float, default=0.4, help="detection confidence")
     p.add_argument("--imgsz", type=int, default=640, help="detector input size")
@@ -289,9 +317,9 @@ def main() -> None:
     print("[init] loading detector ...")
     load_model(args.weights)
     tracker = Tracker(device=args.device, with_reid=args.with_reid)
-    counter = LineCounter(
-        camera_id=args.camera_id, line=args.line, margin_px=args.margin,
-        anchor=args.anchor, invert=args.invert,
+    counter = ZoneCounter(
+        camera_id=args.camera_id, outside=args.outside, door=args.door, inside=args.inside,
+        anchor=args.anchor, stable_frames=args.stable_frames, door_timeout=args.door_timeout,
     )
     sender = EventSender(args.api_url, args.events_file or None)
     source = FrameSource(args.source, realtime=args.realtime, loop=args.loop)
@@ -299,6 +327,7 @@ def main() -> None:
           f"api={'OFF (dry run)' if not args.api_url else args.api_url}")
 
     writer: Optional[cv2.VideoWriter] = None
+    writer_size: Tuple[int, int] = (0, 0)
     fps_ema = 0.0
     idx = -1
     try:
@@ -315,13 +344,14 @@ def main() -> None:
             if idx % args.frame_skip:
                 continue
 
+            frame = resize_frame(frame, args.width)      # every frame, so the line always matches it
             t0 = time.time()
             dets = detect(frame, conf=args.conf, imgsz=args.imgsz)       # Contract 1
             tracks = tracker.update(dets, frame)                         # Contract 2 (CV-2 order: dets, frame)
             for ev in counter.update(tracks, frame.shape, frame_idx=idx):  # Contract 3
                 sender.send(ev)
                 print(f"[event] {ev['event_type']:5s} track={ev['track_id']}  "
-                      f"IN={counter.entered} OUT={counter.exited}")
+                      f"({ev['meta']['transition']})  IN={counter.entered} OUT={counter.exited}")
 
             dt = time.time() - t0
             inst = 1.0 / dt if dt > 0 else 0.0
@@ -332,11 +362,13 @@ def main() -> None:
                 if args.out_video:
                     if writer is None:
                         h, w = frame.shape[:2]
+                        writer_size = (w, h)
                         writer = cv2.VideoWriter(
                             args.out_video, cv2.VideoWriter_fourcc(*"MJPG"),
-                            max(1.0, source.fps / args.frame_skip), (w, h),
+                            max(1.0, source.fps / args.frame_skip), writer_size,
                         )
-                    writer.write(frame)
+                    out_frame = frame if (frame.shape[1], frame.shape[0]) == writer_size else cv2.resize(frame, writer_size)
+                    writer.write(out_frame)
                 if args.show:
                     cv2.imshow("entry/exit", frame)
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):

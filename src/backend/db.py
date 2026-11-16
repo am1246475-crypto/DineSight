@@ -1,24 +1,23 @@
-
 from datetime import datetime, timezone
+import os
+from pathlib import Path
 
 import psycopg
 from psycopg.types.json import Jsonb
+from dotenv import load_dotenv
 
+# Locate .env in the project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 
-# Database connection settings
-DB_CONFIG = {
-    "dbname": "dinesight",
-    "user": "postgres",
-    "password": "salma",
-    "host": "127.0.0.1",
-    "port": 5432,
-}
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing from .env")
 
 
 def get_connection():
-    """Connect Python to PostgreSQL."""
-    return psycopg.connect(**DB_CONFIG)
-
+    return psycopg.connect(DATABASE_URL)
 
 def save_event(event):
     """Save an entry/exit event and update daily statistics."""
