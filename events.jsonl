@@ -28,3 +28,7 @@
 {"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-17T08:57:04.296Z", "meta": {"frame": 139, "anchor": [194.2, 338.0], "transition": "inside->door->outside"}}
 {"camera_id": "entrance", "track_id": 0, "event_type": "exit", "timestamp": "2026-11-17T08:57:10.187Z", "meta": {"frame": 155, "anchor": [213.4, 416.8], "transition": "inside->door->outside"}}
 {"camera_id": "entrance", "track_id": 8, "event_type": "enter", "timestamp": "2026-11-17T08:57:23.171Z", "meta": {"frame": 190, "anchor": [541.3, 323.1], "transition": "outside->door->inside"}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-17T17:08:05.404Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-17T17:09:43.757Z", "meta": {"table_id": "T3", "people": 2, "video_s": 15.7}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_free", "timestamp": "2026-11-17T17:12:19.858Z", "meta": {"table_id": "T1", "people": 0, "video_s": 29.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-17T17:13:44.686Z", "meta": {"table_id": "T4", "people": 3, "video_s": 37.5}}

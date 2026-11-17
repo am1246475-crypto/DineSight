@@ -1,8 +1,11 @@
 """
 cv/main.py  --  CV pipeline for ONE camera:
-    source (file / RTSP / webcam) -> detect() -> Tracker.update() -> ZoneCounter -> events -> API
+    source (file / RTSP / webcam) -> detect() -> Tracker.update() -> analyzer -> events -> API
 
-Run it from inside the cv/ folder (it imports detection.py, tracking.py, counting.py):
+    --mode counting  (default)  entrance camera: ZoneCounter  -> "enter" / "exit" events
+    --mode tables               wide camera:     TableMonitor -> "table_occupied" / "table_free" events
+
+Run it from inside the cv/ folder (it imports detection.py, tracking.py, counting.py, tables.py):
 
     # test on a video file, no backend yet (events are printed and saved to events.jsonl)
     python main.py --source test.mp4 --show --realtime
@@ -10,6 +13,10 @@ Run it from inside the cv/ folder (it imports detection.py, tracking.py, countin
     # set your own zones (normalized 0..1, quote the value because of the ';')
     python main.py --source test.mp4 --show \
         --outside "0,0;0.3,0;0.3,1;0,1" --door "0.3,0;0.7,0;0.7,1;0.3,1" --inside "0.7,0;1,0;1,1;0.7,1"
+
+    # wide camera: table occupancy (tables.json = {"T1": [[x, y], ...], ...}, normalized 0..1)
+    python main.py --mode tables --source hall.mp4 --tables-file tables.json --show --realtime
+    python main.py --mode tables --source hall.mp4 --table "T1=0.4,0.4;0.6,0.4;0.6,0.7;0.4,0.7" --show
 
     # RTSP camera (or the local MediaMTX test stream), send events to the backend
     python main.py --source rtsp://localhost:8554/entrance --camera-id entrance \
@@ -33,6 +40,7 @@ import numpy as np
 
 from counting import DEFAULT_DOOR, DEFAULT_INSIDE, DEFAULT_OUTSIDE, ZoneCounter, parse_polygon
 from detection import detect, load_model
+from tables import TableMonitor, load_tables_file, parse_table
 from tracking import Tracker
 
 
@@ -283,15 +291,58 @@ def draw_overlay(frame, tracks: List[Dict[str, Any]], counter: ZoneCounter, fps:
     cv2.putText(frame, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 
+STATUS_COLORS = {"occupied": (60, 60, 255), "available": (70, 200, 70)}   # BGR: red / green
+
+
+def draw_tables_overlay(frame, tracks: List[Dict[str, Any]], monitor: TableMonitor, fps: float, ts: float) -> None:
+    h, w = frame.shape[:2]
+    status = monitor.status()
+
+    layer = frame.copy()
+    polys = {}
+    for name, poly in monitor.polygons.items():
+        pts = np.array([(int(x * w), int(y * h)) for x, y in poly], dtype=np.int32)
+        polys[name] = pts
+        cv2.fillPoly(layer, [pts], STATUS_COLORS[status[name]["status"]])
+    cv2.addWeighted(layer, 0.30, frame, 0.70, 0, frame)
+
+    for name, pts in polys.items():
+        st = status[name]
+        col = STATUS_COLORS[st["status"]]
+        cv2.polylines(frame, [pts], True, col, 2)
+        x0, y0 = pts.min(axis=0)
+        if st["status"] == "occupied":
+            label = f"{name} OCCUPIED {int(ts - st['since'])}s ({st['people']})"
+        else:
+            label = f"{name} FREE ({st['people']})"
+        cv2.putText(frame, label, (int(x0) + 4, max(44, int(y0) + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+
+    for trk in tracks:
+        x1, y1, x2, y2 = [int(round(v)) for v in trk["bbox"]]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (230, 230, 230), 1)
+        ax_pt, ay_pt = monitor._anchor_point(trk["bbox"])
+        cv2.circle(frame, (int(ax_pt), int(ay_pt)), 4, (0, 0, 255), -1)
+
+    text = f"TABLES occupied {monitor.occupied_count}/{len(status)}   FPS {fps:.1f}"
+    cv2.rectangle(frame, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.putText(frame, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+
 # ====================================================================== main loop
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Entry/exit counting pipeline for one camera")
+    p = argparse.ArgumentParser(description="CV pipeline for one camera: entry/exit counting or table occupancy")
     p.add_argument("--source", required=True, help="video file, rtsp://... URL, or webcam index (0)")
-    p.add_argument("--camera-id", default="entrance", help="camera_id written in every event")
+    p.add_argument("--mode", choices=["counting", "tables"], default="counting", help="counting = entrance camera, tables = wide camera")
+    p.add_argument("--camera-id", default=None, help="camera_id written in every event (default: entrance, or wide in tables mode)")
     p.add_argument("--outside", type=parse_polygon, default=DEFAULT_OUTSIDE, help="outside zone: 'x1,y1;x2,y2;x3,y3;...' normalized 0..1")
     p.add_argument("--door", type=parse_polygon, default=DEFAULT_DOOR, help="door zone (the area people must pass through)")
     p.add_argument("--inside", type=parse_polygon, default=DEFAULT_INSIDE, help="inside zone")
-    p.add_argument("--anchor", choices=["bottom", "center"], default="bottom", help="which point of the box is tested against the zones")
+    p.add_argument("--anchor", choices=["bottom", "center"], default=None, help="which point of the box is tested (default: bottom for counting, center for tables)")
+    p.add_argument("--tables-file", default=None, help="tables mode: JSON file {\"T1\": [[x, y], ...], ...} (normalized 0..1)")
+    p.add_argument("--table", type=parse_table, action="append", help="tables mode: one table 'T1=x1,y1;x2,y2;x3,y3' (repeat for more)")
+    p.add_argument("--occupy-after", type=float, default=5.0, help="tables mode: seconds someone must stay before a table is OCCUPIED")
+    p.add_argument("--free-after", type=float, default=20.0, help="tables mode: seconds a table must be empty before it is FREE")
+    p.add_argument("--gap-tolerance", type=float, default=2.0, help="tables mode: missed-detection gaps shorter than this (s) are ignored")
     p.add_argument("--stable-frames", type=int, default=3, help="frames a track must stay in a zone before the zone change is accepted")
     p.add_argument("--door-timeout", type=int, default=90, help="frames after which an unfinished door crossing is cancelled")
     p.add_argument("--width", type=int, default=768, help="resize every frame to this width before processing (0 = no resize, never enlarges)")
@@ -313,14 +364,35 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.frame_skip = max(1, args.frame_skip)
+    if args.camera_id is None:
+        args.camera_id = "wide" if args.mode == "tables" else "entrance"
+    if args.anchor is None:
+        args.anchor = "center" if args.mode == "tables" else "bottom"
+
+    counter: Optional[ZoneCounter] = None
+    monitor: Optional[TableMonitor] = None
+    if args.mode == "tables":
+        tables: Dict[str, Any] = {}
+        if args.tables_file:
+            tables.update(load_tables_file(args.tables_file))
+        for name, poly in args.table or []:
+            tables[name] = poly
+        if not tables:
+            raise SystemExit("--mode tables needs --tables-file tables.json or at least one --table T1=x,y;x,y;x,y")
+        monitor = TableMonitor(
+            tables, camera_id=args.camera_id, anchor=args.anchor,
+            occupy_after_s=args.occupy_after, free_after_s=args.free_after, gap_tolerance_s=args.gap_tolerance,
+        )
+        print(f"[init] mode=tables  tables={sorted(tables)}")
+    else:
+        counter = ZoneCounter(
+            camera_id=args.camera_id, outside=args.outside, door=args.door, inside=args.inside,
+            anchor=args.anchor, stable_frames=args.stable_frames, door_timeout=args.door_timeout,
+        )
 
     print("[init] loading detector ...")
     load_model(args.weights)
     tracker = Tracker(device=args.device, with_reid=args.with_reid)
-    counter = ZoneCounter(
-        camera_id=args.camera_id, outside=args.outside, door=args.door, inside=args.inside,
-        anchor=args.anchor, stable_frames=args.stable_frames, door_timeout=args.door_timeout,
-    )
     sender = EventSender(args.api_url, args.events_file or None)
     source = FrameSource(args.source, realtime=args.realtime, loop=args.loop)
     print(f"[init] source={args.source}  camera_id={args.camera_id}  "
@@ -348,17 +420,29 @@ def main() -> None:
             t0 = time.time()
             dets = detect(frame, conf=args.conf, imgsz=args.imgsz)       # Contract 1
             tracks = tracker.update(dets, frame)                         # Contract 2 (CV-2 order: dets, frame)
-            for ev in counter.update(tracks, frame.shape, frame_idx=idx):  # Contract 3
+            ts = time.time() if source.is_stream else idx / source.fps     # seconds (video time for files)
+            if monitor is not None:
+                new_events = monitor.update(tracks, frame.shape, ts)
+            else:
+                new_events = counter.update(tracks, frame.shape, frame_idx=idx)   # Contract 3
+            for ev in new_events:
                 sender.send(ev)
-                print(f"[event] {ev['event_type']:5s} track={ev['track_id']}  "
-                      f"({ev['meta']['transition']})  IN={counter.entered} OUT={counter.exited}")
+                if monitor is not None:
+                    print(f"[event] {ev['event_type']:14s} table={ev['meta']['table_id']}  "
+                          f"people={ev['meta']['people']}  (video {ev['meta']['video_s']}s)")
+                else:
+                    print(f"[event] {ev['event_type']:5s} track={ev['track_id']}  "
+                          f"({ev['meta']['transition']})  IN={counter.entered} OUT={counter.exited}")
 
             dt = time.time() - t0
             inst = 1.0 / dt if dt > 0 else 0.0
             fps_ema = inst if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst
 
             if args.show or args.out_video:
-                draw_overlay(frame, tracks, counter, fps_ema)
+                if monitor is not None:
+                    draw_tables_overlay(frame, tracks, monitor, fps_ema, ts)
+                else:
+                    draw_overlay(frame, tracks, counter, fps_ema)
                 if args.out_video:
                     if writer is None:
                         h, w = frame.shape[:2]
@@ -370,7 +454,7 @@ def main() -> None:
                     out_frame = frame if (frame.shape[1], frame.shape[0]) == writer_size else cv2.resize(frame, writer_size)
                     writer.write(out_frame)
                 if args.show:
-                    cv2.imshow("entry/exit", frame)
+                    cv2.imshow("tables" if monitor is not None else "entry/exit", frame)
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         break
     except KeyboardInterrupt:
@@ -382,8 +466,12 @@ def main() -> None:
         if args.show:
             cv2.destroyAllWindows()
         sender.stop()
-        print(f"[done] frames read={idx + 1}  entered={counter.entered}  exited={counter.exited}  "
-              f"sent={sender.sent}  rejected={sender.rejected}")
+        if monitor is not None:
+            print(f"[done] frames read={idx + 1}  tables occupied now={monitor.occupied_count}/{len(monitor.polygons)}  "
+                  f"sent={sender.sent}  rejected={sender.rejected}")
+        else:
+            print(f"[done] frames read={idx + 1}  entered={counter.entered}  exited={counter.exited}  "
+                  f"sent={sender.sent}  rejected={sender.rejected}")
 
 
 if __name__ == "__main__":
