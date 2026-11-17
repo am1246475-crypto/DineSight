@@ -18,3 +18,13 @@
 {"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-16T17:33:59.205Z", "meta": {"frame": 139, "anchor": [194.2, 338.0], "transition": "inside->door->outside"}}
 {"camera_id": "entrance", "track_id": 0, "event_type": "exit", "timestamp": "2026-11-16T17:34:05.100Z", "meta": {"frame": 155, "anchor": [213.4, 416.8], "transition": "inside->door->outside"}}
 {"camera_id": "entrance", "track_id": 8, "event_type": "enter", "timestamp": "2026-11-16T17:34:17.965Z", "meta": {"frame": 190, "anchor": [541.3, 323.1], "transition": "outside->door->inside"}}
+{"camera_id": "entrance", "track_id": 3, "event_type": "exit", "timestamp": "2026-11-17T07:59:51.825Z", "meta": {"frame": 69, "anchor": [212.2, 414.8], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 1, "event_type": "enter", "timestamp": "2026-11-17T08:00:15.071Z", "meta": {"frame": 132, "anchor": [542.2, 350.8], "transition": "outside->door->inside"}}
+{"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-17T08:00:17.676Z", "meta": {"frame": 139, "anchor": [194.2, 338.0], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 0, "event_type": "exit", "timestamp": "2026-11-17T08:00:23.548Z", "meta": {"frame": 155, "anchor": [213.4, 416.8], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 8, "event_type": "enter", "timestamp": "2026-11-17T08:00:36.344Z", "meta": {"frame": 190, "anchor": [541.3, 323.1], "transition": "outside->door->inside"}}
+{"camera_id": "entrance", "track_id": 3, "event_type": "exit", "timestamp": "2026-11-17T08:56:38.553Z", "meta": {"frame": 69, "anchor": [212.2, 414.8], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 1, "event_type": "enter", "timestamp": "2026-11-17T08:57:01.719Z", "meta": {"frame": 132, "anchor": [542.2, 350.8], "transition": "outside->door->inside"}}
+{"camera_id": "entrance", "track_id": 4, "event_type": "exit", "timestamp": "2026-11-17T08:57:04.296Z", "meta": {"frame": 139, "anchor": [194.2, 338.0], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 0, "event_type": "exit", "timestamp": "2026-11-17T08:57:10.187Z", "meta": {"frame": 155, "anchor": [213.4, 416.8], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 8, "event_type": "enter", "timestamp": "2026-11-17T08:57:23.171Z", "meta": {"frame": 190, "anchor": [541.3, 323.1], "transition": "outside->door->inside"}}
