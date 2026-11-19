@@ -5,6 +5,7 @@ cv/main.py  --  CV pipeline for ONE camera:
     --mode counting  (default)  entrance camera: ZoneCounter  -> "enter" / "exit" events
     --mode tables               wide camera:     TableMonitor -> "table_occupied" / "table_free" events
     --mode room                 wide camera:     RoomCounter  -> "room_count" event every ~10 s (people in the hall)
+    --mode all                  all-in-one:      runs entry/exit, room count, and table occupancy simultaneously
 
 Run it from inside the cv/ folder (it imports detection.py, tracking.py, counting.py, tables.py):
 
@@ -23,6 +24,9 @@ Run it from inside the cv/ folder (it imports detection.py, tracking.py, countin
     python main.py --mode room --source hall.mp4 --show --realtime
     python main.py --mode room --source hall.mp4 --room "0.05,0.1;0.95,0.1;0.95,0.95;0.05,0.95" --show
 
+    # all-in-one: entrance count + room count + table occupancy on a single video
+    python main.py --mode all --source hall.mp4 --tables-file tables.json --show
+
     # RTSP camera (or the local MediaMTX test stream), send events to the backend
     python main.py --source rtsp://localhost:8554/entrance --camera-id entrance \
                    --api-url http://localhost:8000/events --frame-skip 2
@@ -33,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import threading
 import time
@@ -359,12 +364,91 @@ def draw_room_overlay(frame, tracks: List[Dict[str, Any]], room: RoomCounter, fp
     cv2.putText(frame, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 
+def draw_all_overlay(
+    frame,
+    tracks: List[Dict[str, Any]],
+    counter: Optional[ZoneCounter],
+    monitor: Optional[TableMonitor],
+    room: Optional[RoomCounter],
+    fps: float,
+    ts: float,
+) -> None:
+    h, w = frame.shape[:2]
+
+    # 1) Room boundary
+    if room is not None:
+        pts = np.array([(int(x * w), int(y * h)) for x, y in room.polygon], dtype=np.int32)
+        layer = frame.copy()
+        cv2.fillPoly(layer, [pts], ROOM_COLOR)
+        cv2.addWeighted(layer, 0.10, frame, 0.90, 0, frame)
+        cv2.polylines(frame, [pts], True, ROOM_COLOR, 1)
+
+    # 2) Entry/exit zones
+    if counter is not None:
+        layer = frame.copy()
+        polys = {}
+        for name, poly in counter.polygons.items():
+            pts = np.array([(int(x * w), int(y * h)) for x, y in poly], dtype=np.int32)
+            polys[name] = pts
+            cv2.fillPoly(layer, [pts], ZONE_COLORS[name])
+        cv2.addWeighted(layer, 0.20, frame, 0.80, 0, frame)
+        for name, pts in polys.items():
+            cv2.polylines(frame, [pts], True, ZONE_COLORS[name], 2)
+            x0, y0 = pts.min(axis=0)
+            cv2.putText(frame, name.upper(), (int(x0) + 4, max(44, int(y0) + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ZONE_COLORS[name], 1)
+
+    # 3) Tables
+    if monitor is not None:
+        status = monitor.status()
+        layer = frame.copy()
+        polys = {}
+        for name, poly in monitor.polygons.items():
+            pts = np.array([(int(x * w), int(y * h)) for x, y in poly], dtype=np.int32)
+            polys[name] = pts
+            cv2.fillPoly(layer, [pts], STATUS_COLORS[status[name]["status"]])
+        cv2.addWeighted(layer, 0.25, frame, 0.75, 0, frame)
+        for name, pts in polys.items():
+            st = status[name]
+            col = STATUS_COLORS[st["status"]]
+            cv2.polylines(frame, [pts], True, col, 2)
+            x0, y0 = pts.min(axis=0)
+            if st["status"] == "occupied":
+                label = f"{name} ({st['people']})"
+            else:
+                label = f"{name} FREE"
+            cv2.putText(frame, label, (int(x0) + 4, max(44, int(y0) + 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+
+    # 4) Person tracks
+    for trk in tracks:
+        x1, y1, x2, y2 = [int(round(v)) for v in trk["bbox"]]
+        tid = int(trk["track_id"])
+        col = _color(tid)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), col, 1)
+        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+        cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+
+    # 5) Top status bar with all metrics
+    bar_items = []
+    if counter is not None:
+        bar_items.append(f"IN {counter.entered}  OUT {counter.exited}")
+    if room is not None:
+        bar_items.append(f"ROOM {room.stable_count}")
+    if monitor is not None:
+        bar_items.append(f"TABLES {monitor.occupied_count}/{len(monitor.polygons)}")
+    bar_items.append(f"FPS {fps:.1f}")
+    text = "   |   ".join(bar_items)
+
+    cv2.rectangle(frame, (0, 0), (w, 30), (0, 0, 0), -1)
+    cv2.putText(frame, text, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+
+
 # ====================================================================== main loop
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CV pipeline for one camera: entry/exit counting or table occupancy")
     p.add_argument("--source", required=True, help="video file, rtsp://... URL, or webcam index (0)")
-    p.add_argument("--mode", choices=["counting", "tables", "room"], default="counting",
-                   help="counting = entrance camera, tables = wide camera (table occupancy), room = wide camera (people in the room)")
+    p.add_argument("--mode", choices=["counting", "tables", "room", "all"], default="counting",
+                   help="counting = entrance camera, tables = wide camera (table occupancy), room = wide camera (people in the room), all = all features together")
     p.add_argument("--camera-id", default=None, help="camera_id written in every event (default: entrance, or wide in tables / room mode)")
     p.add_argument("--outside", type=parse_polygon, default=DEFAULT_OUTSIDE, help="outside zone: 'x1,y1;x2,y2;x3,y3;...' normalized 0..1")
     p.add_argument("--door", type=parse_polygon, default=DEFAULT_DOOR, help="door zone (the area people must pass through)")
@@ -408,7 +492,35 @@ def main() -> None:
     counter: Optional[ZoneCounter] = None
     monitor: Optional[TableMonitor] = None
     room: Optional[RoomCounter] = None
-    if args.mode == "tables":
+    if args.mode == "all":
+        # 1. Entry / Exit counter
+        counter = ZoneCounter(
+            camera_id="entrance", outside=args.outside, door=args.door, inside=args.inside,
+            anchor="bottom", stable_frames=args.stable_frames, door_timeout=args.door_timeout,
+        )
+        # 2. Table monitor
+        tables: Dict[str, Any] = {}
+        tables_path = args.tables_file or ("tables.json" if os.path.exists("tables.json") else None)
+        if tables_path and os.path.exists(tables_path):
+            tables.update(load_tables_file(tables_path))
+        for name, poly in args.table or []:
+            tables[name] = poly
+        if tables:
+            monitor = TableMonitor(
+                tables, camera_id="wide", anchor="center",
+                occupy_after_s=args.occupy_after, free_after_s=args.free_after, gap_tolerance_s=args.gap_tolerance,
+            )
+            print(f"[init] mode=all  tables loaded: {sorted(tables.keys())}")
+        else:
+            print("[init] mode=all  tables: none (pass --tables-file to track tables)")
+        # 3. Room counter
+        polygon = load_room_file(args.room_file) if args.room_file else (args.room or DEFAULT_ROOM)
+        room = RoomCounter(
+            polygon, camera_id="wide", anchor="center",
+            window_s=args.count_window, interval_s=args.count_interval,
+        )
+        print(f"[init] mode=all  counter=active  room={len(polygon)}pts  tables={'active' if monitor else 'none'}")
+    elif args.mode == "tables":
         tables: Dict[str, Any] = {}
         if args.tables_file:
             tables.update(load_tables_file(args.tables_file))
@@ -465,7 +577,15 @@ def main() -> None:
             dets = detect(frame, conf=args.conf, imgsz=args.imgsz)       # Contract 1
             tracks = tracker.update(dets, frame)                         # Contract 2 (CV-2 order: dets, frame)
             ts = time.time() if source.is_stream else idx / source.fps     # seconds (video time for files)
-            if monitor is not None:
+            new_events = []
+            if args.mode == "all":
+                if counter is not None:
+                    new_events.extend(counter.update(tracks, frame.shape, frame_idx=idx))
+                if monitor is not None:
+                    new_events.extend(monitor.update(tracks, frame.shape, ts))
+                if room is not None:
+                    new_events.extend(room.update(tracks, frame.shape, ts))
+            elif monitor is not None:
                 new_events = monitor.update(tracks, frame.shape, ts)
             elif room is not None:
                 new_events = room.update(tracks, frame.shape, ts)
@@ -473,9 +593,10 @@ def main() -> None:
                 new_events = counter.update(tracks, frame.shape, frame_idx=idx)   # Contract 3
             for ev in new_events:
                 sender.send(ev)
-                if room is not None:
-                    print(f"[event] {ev['event_type']:14s} people={ev['meta']['people']}  (video {ts:.1f}s)")
-                elif monitor is not None:
+                et = ev.get("event_type", "")
+                if et == "room_count":
+                    print(f"[event] {et:14s} people={ev['meta']['people']}  (video {ts:.1f}s)")
+                elif et in ("table_occupied", "table_free"):
                     print(f"[event] {ev['event_type']:14s} table={ev['meta']['table_id']}  "
                           f"people={ev['meta']['people']}  (video {ev['meta']['video_s']}s)")
                 else:
@@ -487,7 +608,9 @@ def main() -> None:
             fps_ema = inst if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst
 
             if args.show or args.out_video:
-                if monitor is not None:
+                if args.mode == "all":
+                    draw_all_overlay(frame, tracks, counter, monitor, room, fps_ema, ts)
+                elif monitor is not None:
                     draw_tables_overlay(frame, tracks, monitor, fps_ema, ts)
                 elif room is not None:
                     draw_room_overlay(frame, tracks, room, fps_ema)
@@ -504,7 +627,8 @@ def main() -> None:
                     out_frame = frame if (frame.shape[1], frame.shape[0]) == writer_size else cv2.resize(frame, writer_size)
                     writer.write(out_frame)
                 if args.show:
-                    cv2.imshow("tables" if monitor is not None else "room" if room is not None else "entry/exit", frame)
+                    win_title = "DineSight (All Modes)" if args.mode == "all" else ("tables" if monitor is not None else "room" if room is not None else "entry/exit")
+                    cv2.imshow(win_title, frame)
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         break
     except KeyboardInterrupt:
@@ -516,7 +640,12 @@ def main() -> None:
         if args.show:
             cv2.destroyAllWindows()
         sender.stop()
-        if room is not None:
+        if args.mode == "all":
+            tab_str = f"  tables occupied now={monitor.occupied_count}/{len(monitor.polygons)}" if monitor else ""
+            room_str = f"  people in room={room.stable_count}" if room else ""
+            print(f"[done] frames read={idx + 1}  entered={counter.entered}  exited={counter.exited}{room_str}{tab_str}  "
+                  f"sent={sender.sent}  rejected={sender.rejected}")
+        elif room is not None:
             print(f"[done] frames read={idx + 1}  people now={room.stable_count}  "
                   f"sent={sender.sent}  rejected={sender.rejected}")
         elif monitor is not None:
