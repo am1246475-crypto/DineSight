@@ -7,6 +7,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from dotenv import load_dotenv
 
+
 # Load database configuration
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -41,6 +42,13 @@ def save_event(event):
     camera_id = event["camera_id"]
     track_id = event.get("track_id")
     meta = event.get("meta") or {}
+
+    if not isinstance(meta, dict):
+        raise ValueError("meta must be a dictionary")
+
+    if not camera_id:
+        raise ValueError("camera_id is required")
+
     timestamp = parse_timestamp(
         event.get("timestamp") or event.get("ts")
     )
@@ -56,11 +64,14 @@ def save_event(event):
     if event_type not in allowed_types:
         raise ValueError("Unsupported event_type")
 
+    # Handle room count events separately
     if event_type == "room_count":
         people = meta.get("people")
 
-        if not isinstance(people, int) or people < 0:
-            raise ValueError("room_count requires a non-negative integer people")
+        if type(people) is not int or people < 0:
+            raise ValueError(
+                "room_count requires a non-negative integer people"
+            )
 
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -71,37 +82,83 @@ def save_event(event):
                     """,
                     (camera_id, timestamp, people),
                 )
+
         return {"status": "saved", "event_type": event_type}
 
-    table_id = meta.get("table_id") if event_type.startswith("table_") else None
+    # Handle table events
+    table_id = (
+        meta.get("table_id")
+        if event_type.startswith("table_")
+        else None
+    )
 
     if event_type.startswith("table_") and not table_id:
         raise ValueError("Table events require meta.table_id")
+
+    if event_type == "table_occupied":
+        people = meta.get("people", 0)
+
+        if type(people) is not int or people < 0:
+            raise ValueError(
+                "table_occupied requires a non-negative integer people"
+            )
 
     with get_connection() as conn:
         with conn.cursor() as cur:
 
             if event_type.startswith("table_"):
+
+                # Check that the table exists
                 cur.execute(
-                    "SELECT id FROM restaurant_tables WHERE id = %s FOR UPDATE",
+                    """
+                    SELECT id
+                    FROM restaurant_tables
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
                     (table_id,),
                 )
+
                 if cur.fetchone() is None:
                     raise ValueError(f"Unknown table_id: {table_id}")
 
+                # Get current table status
                 cur.execute(
-                    "SELECT status FROM table_status WHERE table_id = %s FOR UPDATE",
+                    """
+                    SELECT status
+                    FROM table_status
+                    WHERE table_id = %s
+                    FOR UPDATE
+                    """,
                     (table_id,),
                 )
+
                 status_row = cur.fetchone()
-                current_status = status_row[0] if status_row else "free"
+                current_status = (
+                    status_row[0] if status_row else "free"
+                )
 
-                if event_type == "table_occupied" and current_status == "occupied":
-                    return {"status": "ignored", "reason": "already occupied"}
+                # Ignore repeated occupied events
+                if (
+                    event_type == "table_occupied"
+                    and current_status == "occupied"
+                ):
+                    return {
+                        "status": "ignored",
+                        "reason": "already occupied",
+                    }
 
-                if event_type == "table_free" and current_status != "occupied":
-                    return {"status": "ignored", "reason": "no open session"}
+                # Ignore free events without an open session
+                if (
+                    event_type == "table_free"
+                    and current_status != "occupied"
+                ):
+                    return {
+                        "status": "ignored",
+                        "reason": "no open session",
+                    }
 
+            # Insert event and prevent duplicates
             cur.execute(
                 """
                 INSERT INTO events
@@ -125,22 +182,33 @@ def save_event(event):
             if inserted is None:
                 return {"status": "duplicate"}
 
+            # Handle entry and exit events
             if event_type in ("enter", "exit"):
+
                 entered = 1 if event_type == "enter" else 0
                 exited = 1 if event_type == "exit" else 0
 
+                # Calculate occupancy using events up to this timestamp
                 cur.execute(
                     """
                     SELECT
-                        COUNT(*) FILTER (WHERE event_type = 'enter'),
-                        COUNT(*) FILTER (WHERE event_type = 'exit')
+                        COUNT(*) FILTER (
+                            WHERE event_type = 'enter'
+                        ),
+                        COUNT(*) FILTER (
+                            WHERE event_type = 'exit'
+                        )
                     FROM events
                     WHERE event_type IN ('enter', 'exit')
+                      AND ts <= %s
                     """,
+                    (timestamp,),
                 )
+
                 total_entered, total_exited = cur.fetchone()
                 current = max(total_entered - total_exited, 0)
 
+                # Update daily statistics
                 cur.execute(
                     """
                     INSERT INTO daily_stats
@@ -148,18 +216,29 @@ def save_event(event):
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (day)
                     DO UPDATE SET
-                        total_entered = daily_stats.total_entered + EXCLUDED.total_entered,
-                        total_exited = daily_stats.total_exited + EXCLUDED.total_exited,
+                        total_entered =
+                            daily_stats.total_entered
+                            + EXCLUDED.total_entered,
+
+                        total_exited =
+                            daily_stats.total_exited
+                            + EXCLUDED.total_exited,
+
                         peak_occupancy = GREATEST(
                             daily_stats.peak_occupancy,
                             EXCLUDED.peak_occupancy
                         )
                     """,
-                    (timestamp.date(), entered, exited, current),
+                    (
+                        timestamp.date(),
+                        entered,
+                        exited,
+                        current,
+                    ),
                 )
 
+            # Handle table occupied events
             elif event_type == "table_occupied":
-                people = meta.get("people", 0)
 
                 cur.execute(
                     """
@@ -173,9 +252,15 @@ def save_event(event):
                         people = EXCLUDED.people,
                         updated_at = EXCLUDED.updated_at
                     """,
-                    (table_id, timestamp, people, timestamp),
+                    (
+                        table_id,
+                        timestamp,
+                        people,
+                        timestamp,
+                    ),
                 )
 
+                # Start a new table session
                 cur.execute(
                     """
                     INSERT INTO table_sessions
@@ -185,12 +270,15 @@ def save_event(event):
                     (table_id, timestamp, people),
                 )
 
+            # Handle table free events
             elif event_type == "table_free":
+
                 cur.execute(
                     """
                     UPDATE table_sessions
                     SET ended_at = %s
-                    WHERE table_id = %s AND ended_at IS NULL
+                    WHERE table_id = %s
+                      AND ended_at IS NULL
                     """,
                     (timestamp, table_id),
                 )
@@ -229,7 +317,12 @@ def upsert_tables(tables, camera_id="wide", source="automatic"):
                         active = TRUE,
                         updated_at = NOW()
                     """,
-                    (table_id, camera_id, Jsonb(polygon), source),
+                    (
+                        table_id,
+                        camera_id,
+                        Jsonb(polygon),
+                        source,
+                    ),
                 )
 
 
@@ -243,6 +336,7 @@ def get_tables():
                 ORDER BY id
                 """
             )
+
             return [
                 {
                     "id": row[0],
@@ -266,6 +360,7 @@ def get_table_status():
                 ORDER BY table_id
                 """
             )
+
             return [
                 {
                     "table_id": row[0],
@@ -279,19 +374,38 @@ def get_table_status():
 
 
 def get_table_sessions(from_date=None, to_date=None, table_id=None):
+    """Get sessions that overlap the requested time range."""
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, table_id, started_at, ended_at, max_people
                 FROM table_sessions
-                WHERE (%s::timestamptz IS NULL OR started_at >= %s)
-                  AND (%s::timestamptz IS NULL OR started_at <= %s)
-                  AND (%s::text IS NULL OR table_id = %s)
+                WHERE (
+                    %s::timestamptz IS NULL
+                    OR COALESCE(ended_at, 'infinity'::timestamptz) >= %s
+                )
+                AND (
+                    %s::timestamptz IS NULL
+                    OR started_at <= %s
+                )
+                AND (
+                    %s::text IS NULL
+                    OR table_id = %s
+                )
                 ORDER BY started_at DESC
                 """,
-                (from_date, from_date, to_date, to_date, table_id, table_id),
+                (
+                    from_date,
+                    from_date,
+                    to_date,
+                    to_date,
+                    table_id,
+                    table_id,
+                ),
             )
+
             return [
                 {
                     "id": row[0],
@@ -315,8 +429,14 @@ def get_room_counts(from_date=None, to_date=None):
                   AND (%s::timestamptz IS NULL OR ts <= %s)
                 ORDER BY ts DESC
                 """,
-                (from_date, from_date, to_date, to_date),
+                (
+                    from_date,
+                    from_date,
+                    to_date,
+                    to_date,
+                ),
             )
+
             return [
                 {
                     "id": row[0],
@@ -331,15 +451,21 @@ def get_room_counts(from_date=None, to_date=None):
 def get_occupancy():
     with get_connection() as conn:
         with conn.cursor() as cur:
+
             cur.execute(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE event_type = 'enter'),
-                    COUNT(*) FILTER (WHERE event_type = 'exit')
+                    COUNT(*) FILTER (
+                        WHERE event_type = 'enter'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE event_type = 'exit'
+                    )
                 FROM events
                 WHERE event_type IN ('enter', 'exit')
                 """
             )
+
             entered, exited = cur.fetchone()
 
             cur.execute(
@@ -350,6 +476,7 @@ def get_occupancy():
                 LIMIT 1
                 """
             )
+
             row = cur.fetchone()
             in_room = row[0] if row else 0
 
@@ -366,7 +493,10 @@ def get_occupancy_stats():
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT MAX(ts) FROM events")
+            cur.execute(
+                "SELECT MAX(ts) FROM events"
+            )
+
             updated_at = cur.fetchone()[0]
 
     return {
@@ -388,9 +518,12 @@ def get_events(from_date=None, to_date=None, camera_id=None):
                 ORDER BY ts DESC
                 """,
                 (
-                    from_date, from_date,
-                    to_date, to_date,
-                    camera_id, camera_id,
+                    from_date,
+                    from_date,
+                    to_date,
+                    to_date,
+                    camera_id,
+                    camera_id,
                 ),
             )
 
@@ -406,3 +539,4 @@ def get_events(from_date=None, to_date=None, camera_id=None):
                 }
                 for row in cur.fetchall()
             ]
+

@@ -8,19 +8,23 @@ CREATE TABLE IF NOT EXISTS cameras (
 -- 2. Events table
 CREATE TABLE IF NOT EXISTS events (
     id BIGSERIAL PRIMARY KEY,
-    camera_id TEXT REFERENCES cameras(id),
+    camera_id TEXT NOT NULL REFERENCES cameras(id),
     track_id INT,
     event_type TEXT NOT NULL,
     ts TIMESTAMPTZ NOT NULL,
+    table_id TEXT,
     meta JSONB DEFAULT '{}'
 );
 
--- 3. Indexes to make searching faster
+-- 3. Events indexes
 CREATE INDEX IF NOT EXISTS idx_events_ts
 ON events(ts);
 
 CREATE INDEX IF NOT EXISTS idx_events_type
 ON events(event_type);
+
+CREATE INDEX IF NOT EXISTS idx_events_table_id
+ON events(table_id);
 
 -- 4. Daily statistics table
 CREATE TABLE IF NOT EXISTS daily_stats (
@@ -30,7 +34,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     peak_occupancy INT DEFAULT 0
 );
 
--- 5. Insert our project cameras
+-- 5. Insert project cameras
 INSERT INTO cameras (id, role)
 VALUES
     ('entrance', 'entrance'),
@@ -38,11 +42,7 @@ VALUES
     ('wide', 'wide')
 ON CONFLICT (id) DO NOTHING;
 
--- Add table_id to existing events table
-ALTER TABLE events
-ADD COLUMN IF NOT EXISTS table_id TEXT;
-
--- 1. Restaurant tables
+-- 6. Restaurant tables
 CREATE TABLE IF NOT EXISTS restaurant_tables (
     id TEXT PRIMARY KEY,
     camera_id TEXT NOT NULL REFERENCES cameras(id),
@@ -52,17 +52,18 @@ CREATE TABLE IF NOT EXISTS restaurant_tables (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 2. Current table status
+-- 7. Current table status
 CREATE TABLE IF NOT EXISTS table_status (
     table_id TEXT PRIMARY KEY
         REFERENCES restaurant_tables(id),
-    status TEXT NOT NULL CHECK (status IN ('occupied', 'free')),
+    status TEXT NOT NULL
+        CHECK (status IN ('occupied', 'free')),
     since TIMESTAMPTZ,
     people INT DEFAULT 0,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. Table sessions
+-- 8. Table sessions
 CREATE TABLE IF NOT EXISTS table_sessions (
     id BIGSERIAL PRIMARY KEY,
     table_id TEXT NOT NULL REFERENCES restaurant_tables(id),
@@ -71,7 +72,7 @@ CREATE TABLE IF NOT EXISTS table_sessions (
     max_people INT DEFAULT 0
 );
 
--- 4. Room counts
+-- 9. Room counts
 CREATE TABLE IF NOT EXISTS room_counts (
     id BIGSERIAL PRIMARY KEY,
     camera_id TEXT NOT NULL REFERENCES cameras(id),
@@ -79,17 +80,14 @@ CREATE TABLE IF NOT EXISTS room_counts (
     people INT NOT NULL
 );
 
--- 5. Additional indexes
-CREATE INDEX IF NOT EXISTS idx_events_table_id
-ON events(table_id);
-
+-- 10. Additional indexes
 CREATE INDEX IF NOT EXISTS idx_room_counts_ts
 ON room_counts(ts);
 
 CREATE INDEX IF NOT EXISTS idx_table_sessions_table_id
 ON table_sessions(table_id);
 
--- 6. Prevent duplicate events
+-- 11. Prevent duplicate events
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup
 ON events (
     camera_id,
