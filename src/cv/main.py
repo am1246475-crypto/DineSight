@@ -4,6 +4,7 @@ cv/main.py  --  CV pipeline for ONE camera:
 
     --mode counting  (default)  entrance camera: ZoneCounter  -> "enter" / "exit" events
     --mode tables               wide camera:     TableMonitor -> "table_occupied" / "table_free" events
+    --mode room                 wide camera:     RoomCounter  -> "room_count" event every ~10 s (people in the hall)
 
 Run it from inside the cv/ folder (it imports detection.py, tracking.py, counting.py, tables.py):
 
@@ -17,6 +18,10 @@ Run it from inside the cv/ folder (it imports detection.py, tracking.py, countin
     # wide camera: table occupancy (tables.json = {"T1": [[x, y], ...], ...}, normalized 0..1)
     python main.py --mode tables --source hall.mp4 --tables-file tables.json --show --realtime
     python main.py --mode tables --source hall.mp4 --table "T1=0.4,0.4;0.6,0.4;0.6,0.7;0.4,0.7" --show
+
+    # wide camera: people in the room (hall polygon normalized 0..1, default = the whole frame)
+    python main.py --mode room --source hall.mp4 --show --realtime
+    python main.py --mode room --source hall.mp4 --room "0.05,0.1;0.95,0.1;0.95,0.95;0.05,0.95" --show
 
     # RTSP camera (or the local MediaMTX test stream), send events to the backend
     python main.py --source rtsp://localhost:8554/entrance --camera-id entrance \
@@ -40,6 +45,7 @@ import numpy as np
 
 from counting import DEFAULT_DOOR, DEFAULT_INSIDE, DEFAULT_OUTSIDE, ZoneCounter, parse_polygon
 from detection import detect, load_model
+from room_count import DEFAULT_ROOM, RoomCounter, load_room_file
 from tables import TableMonitor, load_tables_file, parse_table
 from tracking import Tracker
 
@@ -328,21 +334,51 @@ def draw_tables_overlay(frame, tracks: List[Dict[str, Any]], monitor: TableMonit
     cv2.putText(frame, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 
+ROOM_COLOR = (255, 160, 40)   # BGR
+
+
+def draw_room_overlay(frame, tracks: List[Dict[str, Any]], room: RoomCounter, fps: float) -> None:
+    h, w = frame.shape[:2]
+    pts = np.array([(int(x * w), int(y * h)) for x, y in room.polygon], dtype=np.int32)
+    layer = frame.copy()
+    cv2.fillPoly(layer, [pts], ROOM_COLOR)
+    cv2.addWeighted(layer, 0.15, frame, 0.85, 0, frame)
+    cv2.polylines(frame, [pts], True, ROOM_COLOR, 2)
+
+    inside = set(room.inside_ids(tracks, frame.shape))
+    for trk in tracks:
+        x1, y1, x2, y2 = [int(round(v)) for v in trk["bbox"]]
+        is_in = trk.get("track_id") in inside
+        col = (70, 220, 70) if is_in else (150, 150, 150)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2 if is_in else 1)
+        ax_pt, ay_pt = room._anchor_point(trk["bbox"])
+        cv2.circle(frame, (int(ax_pt), int(ay_pt)), 4, (0, 0, 255), -1)
+
+    text = f"ROOM people {room.stable_count}  (raw {room.raw_count})   FPS {fps:.1f}"
+    cv2.rectangle(frame, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.putText(frame, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+
 # ====================================================================== main loop
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CV pipeline for one camera: entry/exit counting or table occupancy")
     p.add_argument("--source", required=True, help="video file, rtsp://... URL, or webcam index (0)")
-    p.add_argument("--mode", choices=["counting", "tables"], default="counting", help="counting = entrance camera, tables = wide camera")
-    p.add_argument("--camera-id", default=None, help="camera_id written in every event (default: entrance, or wide in tables mode)")
+    p.add_argument("--mode", choices=["counting", "tables", "room"], default="counting",
+                   help="counting = entrance camera, tables = wide camera (table occupancy), room = wide camera (people in the room)")
+    p.add_argument("--camera-id", default=None, help="camera_id written in every event (default: entrance, or wide in tables / room mode)")
     p.add_argument("--outside", type=parse_polygon, default=DEFAULT_OUTSIDE, help="outside zone: 'x1,y1;x2,y2;x3,y3;...' normalized 0..1")
     p.add_argument("--door", type=parse_polygon, default=DEFAULT_DOOR, help="door zone (the area people must pass through)")
     p.add_argument("--inside", type=parse_polygon, default=DEFAULT_INSIDE, help="inside zone")
-    p.add_argument("--anchor", choices=["bottom", "center"], default=None, help="which point of the box is tested (default: bottom for counting, center for tables)")
+    p.add_argument("--anchor", choices=["bottom", "center"], default=None, help="which point of the box is tested (default: bottom for counting, center for tables / room)")
     p.add_argument("--tables-file", default=None, help="tables mode: JSON file {\"T1\": [[x, y], ...], ...} (normalized 0..1)")
     p.add_argument("--table", type=parse_table, action="append", help="tables mode: one table 'T1=x1,y1;x2,y2;x3,y3' (repeat for more)")
     p.add_argument("--occupy-after", type=float, default=5.0, help="tables mode: seconds someone must stay before a table is OCCUPIED")
     p.add_argument("--free-after", type=float, default=20.0, help="tables mode: seconds a table must be empty before it is FREE")
     p.add_argument("--gap-tolerance", type=float, default=2.0, help="tables mode: missed-detection gaps shorter than this (s) are ignored")
+    p.add_argument("--room", type=parse_polygon, default=None, help="room mode: hall polygon 'x1,y1;x2,y2;x3,y3;...' normalized 0..1 (default: the whole frame)")
+    p.add_argument("--room-file", default=None, help='room mode: JSON file [[x, y], ...] or {"room": [[x, y], ...]} (normalized 0..1)')
+    p.add_argument("--count-window", type=float, default=4.0, help="room mode: seconds of readings the median is taken over (3-5)")
+    p.add_argument("--count-interval", type=float, default=10.0, help="room mode: seconds between room_count events")
     p.add_argument("--stable-frames", type=int, default=3, help="frames a track must stay in a zone before the zone change is accepted")
     p.add_argument("--door-timeout", type=int, default=90, help="frames after which an unfinished door crossing is cancelled")
     p.add_argument("--width", type=int, default=768, help="resize every frame to this width before processing (0 = no resize, never enlarges)")
@@ -365,12 +401,13 @@ def main() -> None:
     args = parse_args()
     args.frame_skip = max(1, args.frame_skip)
     if args.camera_id is None:
-        args.camera_id = "wide" if args.mode == "tables" else "entrance"
+        args.camera_id = "wide" if args.mode in ("tables", "room") else "entrance"
     if args.anchor is None:
-        args.anchor = "center" if args.mode == "tables" else "bottom"
+        args.anchor = "center" if args.mode in ("tables", "room") else "bottom"
 
     counter: Optional[ZoneCounter] = None
     monitor: Optional[TableMonitor] = None
+    room: Optional[RoomCounter] = None
     if args.mode == "tables":
         tables: Dict[str, Any] = {}
         if args.tables_file:
@@ -384,6 +421,13 @@ def main() -> None:
             occupy_after_s=args.occupy_after, free_after_s=args.free_after, gap_tolerance_s=args.gap_tolerance,
         )
         print(f"[init] mode=tables  tables={sorted(tables)}")
+    elif args.mode == "room":
+        polygon = load_room_file(args.room_file) if args.room_file else (args.room or DEFAULT_ROOM)
+        room = RoomCounter(
+            polygon, camera_id=args.camera_id, anchor=args.anchor,
+            window_s=args.count_window, interval_s=args.count_interval,
+        )
+        print(f"[init] mode=room  polygon={len(polygon)} points  window={args.count_window}s  every={args.count_interval}s")
     else:
         counter = ZoneCounter(
             camera_id=args.camera_id, outside=args.outside, door=args.door, inside=args.inside,
@@ -423,11 +467,15 @@ def main() -> None:
             ts = time.time() if source.is_stream else idx / source.fps     # seconds (video time for files)
             if monitor is not None:
                 new_events = monitor.update(tracks, frame.shape, ts)
+            elif room is not None:
+                new_events = room.update(tracks, frame.shape, ts)
             else:
                 new_events = counter.update(tracks, frame.shape, frame_idx=idx)   # Contract 3
             for ev in new_events:
                 sender.send(ev)
-                if monitor is not None:
+                if room is not None:
+                    print(f"[event] {ev['event_type']:14s} people={ev['meta']['people']}  (video {ts:.1f}s)")
+                elif monitor is not None:
                     print(f"[event] {ev['event_type']:14s} table={ev['meta']['table_id']}  "
                           f"people={ev['meta']['people']}  (video {ev['meta']['video_s']}s)")
                 else:
@@ -441,6 +489,8 @@ def main() -> None:
             if args.show or args.out_video:
                 if monitor is not None:
                     draw_tables_overlay(frame, tracks, monitor, fps_ema, ts)
+                elif room is not None:
+                    draw_room_overlay(frame, tracks, room, fps_ema)
                 else:
                     draw_overlay(frame, tracks, counter, fps_ema)
                 if args.out_video:
@@ -454,7 +504,7 @@ def main() -> None:
                     out_frame = frame if (frame.shape[1], frame.shape[0]) == writer_size else cv2.resize(frame, writer_size)
                     writer.write(out_frame)
                 if args.show:
-                    cv2.imshow("tables" if monitor is not None else "entry/exit", frame)
+                    cv2.imshow("tables" if monitor is not None else "room" if room is not None else "entry/exit", frame)
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         break
     except KeyboardInterrupt:
@@ -466,7 +516,10 @@ def main() -> None:
         if args.show:
             cv2.destroyAllWindows()
         sender.stop()
-        if monitor is not None:
+        if room is not None:
+            print(f"[done] frames read={idx + 1}  people now={room.stable_count}  "
+                  f"sent={sender.sent}  rejected={sender.rejected}")
+        elif monitor is not None:
             print(f"[done] frames read={idx + 1}  tables occupied now={monitor.occupied_count}/{len(monitor.polygons)}  "
                   f"sent={sender.sent}  rejected={sender.rejected}")
         else:
