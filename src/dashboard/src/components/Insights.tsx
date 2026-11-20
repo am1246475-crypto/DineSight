@@ -2,17 +2,15 @@ import { fmtMin, type Analytics } from "../lib/analytics";
 
 export function Insights({ a }: { a: Analytics }) {
   const issues: string[] = [];
-  if (a.min < 0) issues.push("الخروج أكبر من الدخول في الفترة (الإشغال نزل تحت الصفر): غالباً دخول لم يُعدّ أو تتبع أعاد ترقيم الشخص.");
-  if (a.flicker.length) issues.push(`${a.flicker.length} شخص عبروا الخط 4 مرات أو أكثر: ممكن تذبذب في الـ tracking أو في خط العدّ.`);
+  if (a.min < 0) issues.push("More exits than entries: some entries were missed.");
+  if (a.flicker.length) issues.push(`${a.flicker.length} people crossed the line 4+ times: tracking may be unstable.`);
   return (
     <div className="insights">
-      <p className="dwell">وقت البقاء: متوسط <b>{fmtMin(a.dwell.avgMin)}</b> · وسيط <b>{fmtMin(a.dwell.medianMin)}</b> (تقدير من تطابق دخول وخروج نفس الـ track_id)</p>
+      <p>Avg stay <b>{fmtMin(a.dwell.avgMin)}</b> · Median <b>{fmtMin(a.dwell.medianMin)}</b></p>
       {issues.length === 0
-        ? <p className="ok">لا توجد مؤشرات مشاكل في جودة العدّ.</p>
+        ? <p className="ok">No counting issues detected.</p>
         : <ul className="issues">{issues.map((t) => <li key={t}>{t}</li>)}</ul>}
-      {a.flicker.length > 0 && (
-        <p className="muted">أكثر track_id عبوراً: {a.flicker.slice(0, 5).map((f) => `#${f.track} (${f.count})`).join("، ")}</p>
-      )}
+      {a.flicker.length > 0 && <p className="muted">Most crossings: {a.flicker.slice(0, 5).map((f) => `#${f.track} (${f.count})`).join(", ")}</p>}
     </div>
   );
 }

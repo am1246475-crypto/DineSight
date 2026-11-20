@@ -1,29 +1,40 @@
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Legend, ReferenceLine, ResponsiveContainer,
          Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
+import { IconPeak } from "./Icons";
 import { config } from "../config";
 import type { Analytics } from "../lib/analytics";
 
 const tip = { contentStyle: { background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 8, color: "var(--ink)" } };
-const hm = (t: number) => new Date(t).toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
-const Empty = ({ text }: { text: string }) => <p className="empty">{text}</p>;
+const hm = (t: number) => new Date(t).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+const Empty = ({ text }: { text: string }) => <p className="empty"><span className="empty-ico"><IconPeak /></span>{text}</p>;
 
-export function OccupancyChart({ series }: { series: Analytics["series"] }) {
-  if (series.length < 2) return <Empty text="لا توجد أحداث في هذه الفترة." />;
+export function OccupancyChart({ series, cap }: { series: Analytics["series"]; cap: number }) {
+  if (series.length < 2) return <Empty text="No events in this period." />;
+  const top = Math.max(...series.map((s) => s.v));
+  const showCap = top >= cap * 0.5; // only draw the capacity line when it is in a readable range
   return (
     <div className="chart"><ResponsiveContainer width="100%" height={240}>
       <AreaChart data={series}>
+        <defs>
+          <linearGradient id="occFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.45} />
+            <stop offset="100%" stopColor="var(--accent)" stopOpacity={0.02} />
+          </linearGradient>
+        </defs>
         <CartesianGrid stroke="var(--line)" vertical={false} />
         <XAxis dataKey="t" type="number" domain={["dataMin", "dataMax"]} tickFormatter={hm} stroke="var(--muted)" fontSize={11} />
-        <YAxis stroke="var(--muted)" fontSize={11} allowDecimals={false} width={30} />
-        <Tooltip {...tip} labelFormatter={hm} formatter={(v) => [v, "الإشغال"]} />
-        <Area type="stepAfter" dataKey="v" stroke="var(--accent)" fill="var(--accent)" fillOpacity={0.15} strokeWidth={2} isAnimationActive={false} />
+        <YAxis stroke="var(--muted)" fontSize={11} allowDecimals={false} width={30}
+               domain={[0, (m: number) => Math.max(m, showCap ? cap : 0, 4)]} />
+        <Tooltip {...tip} labelFormatter={hm} formatter={(v) => [v, "Occupancy"]} />
+        {showCap && <ReferenceLine y={cap} stroke="var(--bad)" strokeDasharray="5 4" label={{ value: "Capacity", fill: "var(--bad)", fontSize: 11, position: "insideTopLeft" }} />}
+        <Area type="monotone" dataKey="v" stroke="var(--accent)" fill="url(#occFill)" strokeWidth={2.5} isAnimationActive={false} />
       </AreaChart>
     </ResponsiveContainer></div>
   );
 }
 
 export function HourlyChart({ data }: { data: Analytics["hourly"] }) {
-  if (!data.some((d) => d.enter || d.exit)) return <Empty text="لا توجد بيانات." />;
+  if (!data.some((d) => d.enter || d.exit)) return <Empty text="No data." />;
   return (
     <div className="chart"><ResponsiveContainer width="100%" height={240}>
       <BarChart data={data}>
@@ -31,7 +42,7 @@ export function HourlyChart({ data }: { data: Analytics["hourly"] }) {
         <XAxis dataKey="hour" stroke="var(--muted)" fontSize={11} interval={2} />
         <YAxis stroke="var(--muted)" fontSize={11} allowDecimals={false} width={30} />
         <Tooltip {...tip} cursor={{ fill: "var(--line)", opacity: 0.4 }} />
-        <Legend formatter={(v) => (v === "enter" ? "دخول" : "خروج")} />
+        <Legend formatter={(v) => (v === "enter" ? "Enter" : "Exit")} />
         <Bar dataKey="enter" fill="var(--enter)" radius={[3, 3, 0, 0]} isAnimationActive={false} />
         <Bar dataKey="exit" fill="var(--exit)" radius={[3, 3, 0, 0]} isAnimationActive={false} />
       </BarChart>
@@ -40,13 +51,13 @@ export function HourlyChart({ data }: { data: Analytics["hourly"] }) {
 }
 
 export function CamerasPanel({ cameras }: { cameras: Analytics["cameras"] }) {
-  if (!cameras.length) return <Empty text="لا توجد بيانات." />;
+  if (!cameras.length) return <Empty text="No data." />;
   const max = Math.max(...cameras.map((c) => c.enter + c.exit), 1);
   return (
     <ul className="cams">
       {cameras.map((c) => (
         <li key={c.id}>
-          <div><b>{c.id}</b><span>{c.enter} دخول · {c.exit} خروج</span></div>
+          <div><b>{c.id}</b><span>{c.enter} in · {c.exit} out</span></div>
           <div className="bar"><i className="e" style={{ width: `${(c.enter / max) * 100}%` }} /><i className="x" style={{ width: `${(c.exit / max) * 100}%` }} /></div>
         </li>
       ))}
@@ -56,7 +67,7 @@ export function CamerasPanel({ cameras }: { cameras: Analytics["cameras"] }) {
 
 /** Where people cross the virtual line (meta.anchor, in frame pixels): helps you tune the line. */
 export function CrossingMap({ points }: { points: Analytics["crossings"] }) {
-  if (!points.length) return <Empty text="لا توجد نقاط عبور (meta.anchor)." />;
+  if (!points.length) return <Empty text="No crossing points." />;
   const { w, h } = config.frame;
   return (
     <div className="chart"><ResponsiveContainer width="100%" height={240}>
