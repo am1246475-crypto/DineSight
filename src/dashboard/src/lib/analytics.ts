@@ -9,6 +9,9 @@ export interface Analytics {
   crossings: { x: number; y: number; type: EventType }[];
   dwell: { avgMin: number | null; medianMin: number | null; n: number };
   flicker: { track: number; count: number }[];
+  trend: { enter: number[]; exit: number[]; occ: number[] };
+  delta: { enter: number; exit: number };
+  heat: number[][];
 }
 
 const ms = (e: CountEvent) => new Date(e.timestamp).getTime();
@@ -49,12 +52,24 @@ export function analyze(events: CountEvent[], current: number): Analytics {
       if (d > 0 && d < 360) stays.push(d);
     }
   }
+  const T = Date.now(), step = 5 * 60_000;
+  const trend = { enter: Array(12).fill(0) as number[], exit: Array(12).fill(0) as number[], occ: Array(12).fill(0) as number[] };
+  const delta = { enter: 0, exit: 0 };
+  const heat = Array.from({ length: 7 }, () => Array(24).fill(0) as number[]);
+  for (const e of asc) {
+    const age = T - ms(e), d = new Date(ms(e));
+    heat[d.getDay()][d.getHours()]++;
+    if (age < 3600_000) trend[e.event_type][11 - Math.floor(age / step)]++;
+    if (age < 3600_000) delta[e.event_type]++; else if (age < 7200_000) delta[e.event_type]--;
+  }
+  trend.occ[11] = current;
+  for (let i = 11; i > 0; i--) trend.occ[i - 1] = trend.occ[i] - (trend.enter[i] - trend.exit[i]);
   stays.sort((a, b) => a - b);
   const avg = stays.length ? stays.reduce((s, v) => s + v, 0) / stays.length : null;
   const median = stays.length ? stays[Math.floor(stays.length / 2)] : null;
 
   return {
-    series, peak, min, hourly, crossings,
+    series, peak, min, hourly, crossings, trend, delta, heat,
     cameras: [...cams].map(([id, v]) => ({ id, ...v })),
     dwell: { avgMin: avg, medianMin: median, n: stays.length },
     flicker: [...counts].filter(([, n]) => n >= 4).map(([track, count]) => ({ track, count })).sort((a, b) => b.count - a.count),
@@ -62,7 +77,7 @@ export function analyze(events: CountEvent[], current: number): Analytics {
 }
 
 export const fmtMin = (m: number | null) =>
-  m === null ? "–" : m < 60 ? `${Math.round(m)} د` : `${Math.floor(m / 60)} س ${Math.round(m % 60)} د`;
+  m === null ? "–" : m < 60 ? `${Math.round(m)} m` : `${Math.floor(m / 60)} h ${Math.round(m % 60)} m`;
 
 export function toCsv(events: CountEvent[]): string {
   const rows = events.map((e) =>
@@ -72,5 +87,5 @@ export function toCsv(events: CountEvent[]): string {
 
 export const ago = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000));
-  return s < 60 ? `${s} ث` : s < 3600 ? `${Math.floor(s / 60)} د` : `${Math.floor(s / 3600)} س`;
+  return s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} m` : `${Math.floor(s / 3600)} h`;
 };

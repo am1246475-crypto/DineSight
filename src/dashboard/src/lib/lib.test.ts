@@ -54,7 +54,7 @@ describe("normalizeEvents", () => {
 describe("formatting", () => {
   it("formats minutes", () => {
     expect(fmtMin(null)).toBe("–");
-    expect(fmtMin(90)).toBe("1 س 30 د");
+    expect(fmtMin(90)).toBe("1 h 30 m");
   });
   it("exports CSV with a BOM header", () => {
     const csv = toCsv([ev(1, "enter", 0)]);
