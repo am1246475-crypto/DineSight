@@ -186,7 +186,7 @@ class EventSender:
     * 4xx (API rejected the event) -> logged and dropped, no endless retry.
     """
 
-    def __init__(self, api_url: Optional[str], jsonl_path: Optional[str], max_queue: int = 1000, timeout: float = 3.0):
+    def __init__(self, api_url: Optional[str], jsonl_path: Optional[str], max_queue: int = 1000, timeout: float = 10.0):
         self.api_url = api_url
         self.jsonl_path = jsonl_path
         self.timeout = timeout
@@ -550,6 +550,25 @@ def main() -> None:
     load_model(args.weights)
     tracker = Tracker(device=args.device, with_reid=args.with_reid)
     sender = EventSender(args.api_url, args.events_file or None)
+    if args.api_url and monitor is not None and monitor.polygons:
+        try:
+            base_url = args.api_url.rsplit("/events", 1)[0]
+            tables_url = f"{base_url}/tables"
+            payload = json.dumps({
+                "camera_id": args.camera_id or "wide",
+                "source": "automatic",
+                "tables": monitor.polygons,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                tables_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="PUT",
+            )
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                print(f"[init] synced {len(monitor.polygons)} tables with backend: {tables_url}")
+        except Exception as e:
+            print(f"[init] note: tables sync with backend skipped ({e})")
     source = FrameSource(args.source, realtime=args.realtime, loop=args.loop)
     print(f"[init] source={args.source}  camera_id={args.camera_id}  "
           f"api={'OFF (dry run)' if not args.api_url else args.api_url}")

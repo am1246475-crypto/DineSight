@@ -2,6 +2,8 @@
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import threading
+from contextlib import contextmanager
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -17,9 +19,27 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing from .env")
 
+_db_lock = threading.Lock()
+_conn = None
 
+
+@contextmanager
 def get_connection():
-    return psycopg.connect(DATABASE_URL)
+    global _conn
+    with _db_lock:
+        if _conn is None or _conn.closed:
+            _conn = psycopg.connect(DATABASE_URL)
+        else:
+            try:
+                _conn.execute("SELECT 1")
+            except Exception:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = psycopg.connect(DATABASE_URL)
+        with _conn.transaction():
+            yield _conn
 
 
 def parse_timestamp(value):
@@ -120,7 +140,16 @@ def save_event(event):
                 )
 
                 if cur.fetchone() is None:
-                    raise ValueError(f"Unknown table_id: {table_id}")
+                    # Auto-register table if not previously defined so events are never dropped
+                    cur.execute(
+                        """
+                        INSERT INTO restaurant_tables
+                            (id, camera_id, polygon, source, active, updated_at)
+                        VALUES (%s, %s, '[]'::jsonb, 'auto_event', TRUE, NOW())
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (table_id, camera_id),
+                    )
 
                 # Get current table status
                 cur.execute(

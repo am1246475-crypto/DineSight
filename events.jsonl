@@ -45,3 +45,31 @@
 {"camera_id": "wide", "track_id": null, "event_type": "table_free", "timestamp": "2026-11-19T17:03:10.136Z", "meta": {"table_id": "T1", "people": 0, "video_s": 29.8}}
 {"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-19T17:03:56.286Z", "meta": {"people": 8}}
 {"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-19T17:04:34.923Z", "meta": {"table_id": "T4", "people": 3, "video_s": 37.5}}
+{"camera_id": "entrance", "track_id": 10, "event_type": "exit", "timestamp": "2026-11-20T12:48:15.834Z", "meta": {"frame": 381, "anchor": [221.0, 431.6], "transition": "inside->door->outside"}}
+{"camera_id": "entrance", "track_id": 0, "event_type": "enter", "timestamp": "2026-11-20T12:55:22.930Z", "meta": {"frame": 88, "anchor": [554.2, 428.3], "transition": "outside->door->inside"}}
+{"camera_id": "entrance", "track_id": 17, "event_type": "exit", "timestamp": "2026-11-20T12:56:36.557Z", "meta": {"frame": 283, "anchor": [184.2, 430.8], "transition": "inside->door->outside"}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T07:53:19.119Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T07:54:58.166Z", "meta": {"table_id": "T3", "people": 2, "video_s": 15.7}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T08:25:54.900Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T08:47:51.921Z", "meta": {"people": 2}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T08:48:23.314Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T08:49:43.714Z", "meta": {"people": 5}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T08:50:02.835Z", "meta": {"table_id": "T3", "people": 2, "video_s": 15.7}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T08:58:44.554Z", "meta": {"people": 2}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T08:59:15.744Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T09:40:52.343Z", "meta": {"people": 2}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T09:41:23.136Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T09:42:42.671Z", "meta": {"people": 5}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T09:43:01.509Z", "meta": {"table_id": "T3", "people": 2, "video_s": 15.7}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T09:44:33.258Z", "meta": {"people": 4}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_free", "timestamp": "2026-11-21T09:45:38.120Z", "meta": {"table_id": "T1", "people": 0, "video_s": 29.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T09:46:24.356Z", "meta": {"people": 8}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T09:47:02.864Z", "meta": {"table_id": "T4", "people": 3, "video_s": 37.5}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T10:18:14.391Z", "meta": {"people": 2}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T10:18:45.514Z", "meta": {"table_id": "T1", "people": 1, "video_s": 6.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T10:20:05.053Z", "meta": {"people": 5}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T10:20:24.034Z", "meta": {"table_id": "T3", "people": 2, "video_s": 15.7}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T10:21:56.742Z", "meta": {"people": 4}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_free", "timestamp": "2026-11-21T10:23:01.119Z", "meta": {"table_id": "T1", "people": 0, "video_s": 29.8}}
+{"camera_id": "wide", "track_id": null, "event_type": "room_count", "timestamp": "2026-11-21T10:23:47.360Z", "meta": {"people": 8}}
+{"camera_id": "wide", "track_id": null, "event_type": "table_occupied", "timestamp": "2026-11-21T10:24:26.457Z", "meta": {"table_id": "T4", "people": 3, "video_s": 37.5}}

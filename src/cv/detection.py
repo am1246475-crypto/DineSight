@@ -21,7 +21,6 @@ def detect(frame, conf=0.4, imgsz=640, classes=None):
         conf=conf,
         imgsz=imgsz,
         device=_DEVICE,
-        half=(_DEVICE != "cpu"),
         verbose=False,
     )[0]
     out = []
