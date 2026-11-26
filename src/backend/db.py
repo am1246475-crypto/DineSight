@@ -97,6 +97,14 @@ def save_event(event):
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    INSERT INTO cameras (id, role)
+                    VALUES (%s, 'general')
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (camera_id,),
+                )
+                cur.execute(
+                    """
                     INSERT INTO room_counts (camera_id, ts, people)
                     VALUES (%s, %s, %s)
                     """,
@@ -125,6 +133,14 @@ def save_event(event):
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO cameras (id, role)
+                VALUES (%s, 'general')
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (camera_id,),
+            )
 
             if event_type.startswith("table_"):
 

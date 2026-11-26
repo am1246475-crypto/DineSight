@@ -1,4 +1,6 @@
 
+import asyncio
+import os
 from datetime import datetime
 from typing import Optional, Literal
 
@@ -16,9 +18,73 @@ from db import (
     get_table_sessions,
     get_room_counts,
 )
-
+from routes.analytics import router as analytics_router
+from kafka.consumer import DineSightKafkaConsumer # type: ignore
 
 app = FastAPI(title="DineSight API")
+app.include_router(analytics_router)
+
+# Optional Kafka Consumer instance
+_kafka_consumer: Optional[DineSightKafkaConsumer] = None
+
+
+async def broadcast_event_data(event_data: dict):
+    event_type = event_data.get("event_type")
+    meta = event_data.get("meta") or {}
+
+    if event_type in ("enter", "exit"):
+        stats = get_occupancy_stats()
+        await manager.broadcast({
+            "type": "occupancy",
+            "current": stats["current"],
+            "entered": stats["entered"],
+            "exited": stats["exited"],
+            "in_room": stats["in_room"],
+        })
+    elif event_type in ("table_occupied", "table_free"):
+        table_id = meta.get("table_id")
+        statuses = get_table_status()
+        current_status = next(
+            (item for item in statuses if item["table_id"] == table_id),
+            None,
+        )
+        await manager.broadcast({
+            "type": "table",
+            "table_id": table_id,
+            "event_type": event_type,
+            "status": current_status,
+        })
+    elif event_type == "room_count":
+        room_counts = get_room_counts()
+        latest_count = room_counts[0] if room_counts else None
+        await manager.broadcast({
+            "type": "room_count",
+            "data": latest_count,
+        })
+
+
+@app.on_event("startup")
+async def startup_event():
+    global _kafka_consumer
+    loop = asyncio.get_running_loop()
+
+    def _sync_broadcast(ev_dict: dict):
+        asyncio.run_coroutine_threadsafe(broadcast_event_data(ev_dict), loop)
+
+    try:
+        _kafka_consumer = DineSightKafkaConsumer(broadcast_callback=_sync_broadcast)
+        _kafka_consumer.start_background()
+        print("[FastAPI] Integrated Kafka Consumer started; real-time dashboard updates active!")
+    except Exception as exc:
+        print(f"[FastAPI] Note: Kafka Consumer background start skipped ({exc})")
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    global _kafka_consumer
+    if _kafka_consumer:
+        _kafka_consumer.stop()
+
 
 
 # Allow Dashboard to communicate with the backend
@@ -177,50 +243,8 @@ async def create_event(event: Event):
                 **result
             }
 
-        # Entry / Exit event
-        if event.event_type in ("enter", "exit"):
-
-            stats = get_occupancy_stats()
-
-            await manager.broadcast({
-                "type": "occupancy",
-                "current": stats["current"],
-                "entered": stats["entered"],
-                "exited": stats["exited"],
-                "in_room": stats["in_room"],
-            })
-
-        # Table event
-        elif event.event_type in ("table_occupied", "table_free"):
-
-            table_id = event.meta["table_id"]
-            statuses = get_table_status()
-
-            current_status = next(
-                (
-                    item for item in statuses
-                    if item["table_id"] == table_id
-                ),
-                None
-            )
-
-            await manager.broadcast({
-                "type": "table",
-                "table_id": table_id,
-                "event_type": event.event_type,
-                "status": current_status,
-            })
-
-        # Room count event
-        elif event.event_type == "room_count":
-
-            room_counts = get_room_counts()
-            latest_count = room_counts[0] if room_counts else None
-
-            await manager.broadcast({
-                "type": "room_count",
-                "data": latest_count,
-            })
+        # Broadcast live update to WebSockets
+        await broadcast_event_data(event_data)
 
         return {
             "message": "Event saved successfully",
@@ -386,3 +410,21 @@ async def websocket_live(websocket: WebSocket):
 
     except Exception:
         manager.disconnect(websocket)
+
+
+# =========================
+# Kafka Metrics Endpoint
+# =========================
+
+@app.get("/kafka/metrics")
+def kafka_metrics():
+    global _kafka_consumer
+    if _kafka_consumer:
+        return _kafka_consumer.get_metrics()
+    return {
+        "status": "idle",
+        "message": "Kafka consumer not currently running inside API process (start via CLI or set KAFKA_ENABLE_CONSUMER=1)",
+        "bootstrap_servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
+        "topic": os.getenv("KAFKA_TOPIC_EVENTS", "dinesight.events.raw"),
+    }
+

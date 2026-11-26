@@ -54,6 +54,26 @@ from room_count import DEFAULT_ROOM, RoomCounter, load_room_file
 from tables import TableMonitor, load_tables_file, parse_table
 from tracking import Tracker
 
+import sys
+from pathlib import Path
+
+# Ensure root and backend paths are in sys.path regardless of execution directory
+_ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+_BACKEND_DIR = _ROOT_DIR / "src" / "backend"
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+try:
+    from src.backend.kafka.producer import DineSightKafkaProducer
+except ImportError:
+    try:
+        from kafka.producer import DineSightKafkaProducer
+    except ImportError:
+        DineSightKafkaProducer = None
+
+
 
 # ====================================================================== resize
 def resize_frame(frame, target_width: int):
@@ -186,7 +206,15 @@ class EventSender:
     * 4xx (API rejected the event) -> logged and dropped, no endless retry.
     """
 
-    def __init__(self, api_url: Optional[str], jsonl_path: Optional[str], max_queue: int = 1000, timeout: float = 10.0):
+    def __init__(
+        self,
+        api_url: Optional[str],
+        jsonl_path: Optional[str],
+        kafka_broker: Optional[str] = None,
+        kafka_topic: str = "dinesight.events.raw",
+        max_queue: int = 1000,
+        timeout: float = 10.0,
+    ):
         self.api_url = api_url
         self.jsonl_path = jsonl_path
         self.timeout = timeout
@@ -195,6 +223,15 @@ class EventSender:
         self._file_lock = threading.Lock()
         self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
+
+        self.kafka_producer = None
+        if kafka_broker and DineSightKafkaProducer is not None:
+            self.kafka_producer = DineSightKafkaProducer(
+                bootstrap_servers=kafka_broker,
+                default_topic=kafka_topic,
+            )
+            print(f"[init] Kafka Producer active -> {kafka_broker} ({kafka_topic})")
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -202,6 +239,8 @@ class EventSender:
         if self.jsonl_path:
             with self._file_lock, open(self.jsonl_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(event) + "\n")
+        if self.kafka_producer:
+            self.kafka_producer.send_event(event)
         if not self.api_url:
             return
         try:
@@ -259,6 +298,8 @@ class EventSender:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=8.0)
+        if self.kafka_producer:
+            self.kafka_producer.close()
 
 
 # ====================================================================== drawing
@@ -473,6 +514,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--with-reid", action="store_true", help="enable appearance Re-ID in the tracker (slower)")
     p.add_argument("--frame-skip", type=int, default=1, help="process every Nth frame (1 = all)")
     p.add_argument("--api-url", default=None, help="e.g. http://localhost:8000/events (omit = dry run)")
+    p.add_argument("--kafka-broker", default=None, help="Kafka broker address (e.g. localhost:9092) to stream events via Kafka")
+    p.add_argument("--kafka-topic", default="dinesight.events.raw", help="Kafka topic for events")
     p.add_argument("--events-file", default="events.jsonl", help="local copy of every event ('' to disable)")
     p.add_argument("--show", action="store_true", help="show a preview window")
     p.add_argument("--out-video", default=None, help="save the annotated video (e.g. out.avi)")
@@ -549,7 +592,12 @@ def main() -> None:
     print("[init] loading detector ...")
     load_model(args.weights)
     tracker = Tracker(device=args.device, with_reid=args.with_reid)
-    sender = EventSender(args.api_url, args.events_file or None)
+    sender = EventSender(
+        args.api_url,
+        args.events_file or None,
+        kafka_broker=args.kafka_broker,
+        kafka_topic=args.kafka_topic,
+    )
     if args.api_url and monitor is not None and monitor.polygons:
         try:
             base_url = args.api_url.rsplit("/events", 1)[0]
